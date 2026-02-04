@@ -1,0 +1,16 @@
+Doc for New installation of Voltmx in Standard Bank Environment -
+
+Download required installer that is Iris 10.0.3 the lastest for now.
+In Windows App take the .exe file and install it.
+After installation do the following steps -
+Navigate to the default.js file in your IRIS installation directory:
+C:\Program Files\Volt Iris\config\default.js
+Open the default.js file and search for the line:
+console.log('Loading[config]..' + \_\_filename);
+Add the following line directly below it:
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = 0;
+
+    Save the file, restart IRIS, and then verify the Foundry connectivity.
+
+Note: This step need to perform whenever we get the latest plugin.
+To connect to foundry need to do the following steps -
