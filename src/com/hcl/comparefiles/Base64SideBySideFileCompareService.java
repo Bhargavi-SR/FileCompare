@@ -1,11 +1,8 @@
 package com.hcl.comparefiles;
 
 import java.io.*;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.util.*;
-import javax.net.ssl.*;
-import java.security.cert.X509Certificate;
+import java.util.Base64;
 import org.apache.log4j.Logger;
 
 /* Volt MX Middleware */
@@ -15,16 +12,16 @@ import com.hcl.voltmx.middleware.controller.DataControllerResponse;
 import com.hcl.voltmx.middleware.dataobject.*;
 
 /* Apache POI & PDFBox */
-import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xwpf.usermodel.*;
+import org.apache.poi.ss.usermodel.*;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 
-public class SideBySideFileCompareService implements JavaService2 {
+public class Base64SideBySideFileCompareService implements JavaService2 {
 
-    private static final Logger logger = Logger.getLogger(SideBySideFileCompareService.class);
-    private static final double SIMILARITY_THRESHOLD = 0.70; // Matches paragraph logic
+    private static final Logger logger = Logger.getLogger(Base64SideBySideFileCompareService.class);
+    private static final double SIMILARITY_THRESHOLD = 0.70; 
 
     @Override
     public Object invoke(String methodID, Object[] inputArray, DataControllerRequest request, DataControllerResponse response) {
@@ -32,22 +29,20 @@ public class SideBySideFileCompareService implements JavaService2 {
         Dataset ds = new Dataset("diffResults");
 
         try {
-            String urlA = request.getParameter("urlA");
-            String urlB = request.getParameter("urlB");
-            String fileNameA = request.getParameter("fileNameA");
-            String fileNameB = request.getParameter("fileNameB");
+            String base64A = request.getParameter("fileA_base64");
+            String base64B = request.getParameter("fileB_base64");
+            String extA = request.getParameter("extA").toLowerCase();
+            String extB = request.getParameter("extB").toLowerCase();
 
-            disableSSL();
+            List<String> leftLines = extractText(base64A, extA);
+            List<String> rightLines = extractText(base64B, extB);
 
-            List<String> leftLines = extractTextFromUrl(urlA, fileNameA);
-            List<String> rightLines = extractTextFromUrl(urlB, fileNameB);
-
-            List<DiffRow> finalRows = performPriorityAlignment(leftLines, rightLines);
+            List<DiffRow> finalRows = performAlignment(leftLines, rightLines);
 
             for (DiffRow row : finalRows) {
                 Record rec = new Record();
                 
-                // INLINE HIGHLIGHTING LOGIC
+                // INTEGRATED: Generate inline word-level diff for RichText if MODIFIED
                 if ("MODIFIED".equals(row.type)) {
                     rec.addParam(new Param("leftText", getInlineDiff(row.left, row.right, true)));
                     rec.addParam(new Param("rightText", getInlineDiff(row.left, row.right, false)));
@@ -62,18 +57,18 @@ public class SideBySideFileCompareService implements JavaService2 {
 
             result.addDataset(ds);
             result.addParam(new Param("status", "SUCCESS"));
-
         } catch (Exception e) {
-            logger.error("Error in SideBySideFileCompareService", e);
+            logger.error("Error comparing files", e);
             result.addParam(new Param("status", "FAILED"));
             result.addParam(new Param("errorMessage", e.getMessage()));
         }
         return result;
     }
 
-    /* ================= WORD-LEVEL HIGHLIGHTING ================= */
+    /* ================= WORD-LEVEL HIGHLIGHTING FOR RICHTEXT ================= */
+    
     private String getInlineDiff(String left, String right, boolean isOldSide) {
-        // Uses pipes for tables or spaces for paragraphs
+        // Detect if table row or paragraph to use correct delimiter
         String delimiter = (left.contains("|")) ? "\\|" : "\\s+";
         String joiner = (left.contains("|")) ? " | " : " ";
         
@@ -81,12 +76,14 @@ public class SideBySideFileCompareService implements JavaService2 {
         String[] rightWords = right.split(delimiter);
         
         Set<String> otherSide = new HashSet<>();
-        for (String w : (isOldSide ? rightWords : leftWords)) otherSide.add(w.trim());
+        for (String w : (isOldSide ? rightWords : leftWords)) {
+            otherSide.add(w.trim());
+        }
 
         StringBuilder sb = new StringBuilder();
         String[] currentSide = isOldSide ? leftWords : rightWords;
         
-        // Dark Red for deletions, Dark Green for additions
+        // Highlight Color: Red for deletions (Old), Green for additions (New)
         String highlightColor = isOldSide ? "#C0392B" : "#27AE60"; 
 
         for (String word : currentSide) {
@@ -94,7 +91,7 @@ public class SideBySideFileCompareService implements JavaService2 {
             if (cleanWord.isEmpty()) continue;
 
             if (!otherSide.contains(cleanWord)) {
-                // Wrap specific modified words in font tags for RichText
+                // Wrap only the modified words in Font tags for the Iris RichText widget
                 sb.append("<b><font color='").append(highlightColor).append("'>")
                   .append(cleanWord).append("</font></b>").append(joiner);
             } else {
@@ -104,18 +101,25 @@ public class SideBySideFileCompareService implements JavaService2 {
         return sb.toString().trim();
     }
 
-    /* ================= ALIGNMENT LOGIC ================= */
-    private List<DiffRow> performPriorityAlignment(List<String> a, List<String> b) {
+    /* ================= ALIGNMENT & SIMILARITY ================= */
+
+    private List<DiffRow> performAlignment(List<String> a, List<String> b) {
         int m = a.size(), n = b.size();
         int[][] lcs = new int[m + 1][n + 1];
+
         for (int i = 1; i <= m; i++) {
             for (int j = 1; j <= n; j++) {
-                if (a.get(i - 1).equals(b.get(j - 1))) lcs[i][j] = lcs[i - 1][j - 1] + 1;
-                else lcs[i][j] = Math.max(lcs[i - 1][j], lcs[i][j - 1]);
+                if (a.get(i - 1).equals(b.get(j - 1))) {
+                    lcs[i][j] = lcs[i - 1][j - 1] + 1;
+                } else {
+                    lcs[i][j] = Math.max(lcs[i - 1][j], lcs[i][j - 1]);
+                }
             }
         }
+
         List<DiffRow> result = new ArrayList<>();
         int i = m, j = n;
+
         while (i > 0 || j > 0) {
             if (i > 0 && j > 0 && a.get(i - 1).equals(b.get(j - 1))) {
                 result.add(new DiffRow(a.get(i - 1), b.get(j - 1), "UNCHANGED"));
@@ -141,8 +145,9 @@ public class SideBySideFileCompareService implements JavaService2 {
             String prefix1 = s1.split("\\|")[0].trim();
             String prefix2 = s2.split("\\|")[0].trim();
             if (!prefix1.equals(prefix2)) return 0.0;
-        } else if (s1.contains("|") != s2.contains("|")) return 0.0;
-        
+        } else if (s1.contains("|") != s2.contains("|")) {
+            return 0.0;
+        }
         int distance = levenshteinDistance(s1, s2);
         return 1.0 - ((double) distance / Math.max(s1.length(), s2.length()));
     }
@@ -164,78 +169,60 @@ public class SideBySideFileCompareService implements JavaService2 {
     }
 
     /* ================= EXTRACTION LOGIC ================= */
-    private List<String> extractTextFromUrl(String urlStr, String fileName) throws Exception {
-        File file = downloadFile(urlStr, fileName);
-        String ext = fileName.substring(fileName.lastIndexOf('.') + 1).toLowerCase();
+
+    private List<String> extractText(String base64, String ext) throws Exception {
+        String clean = base64.contains(",") ? base64.split(",")[1] : base64;
+        byte[] bytes = Base64.getDecoder().decode(clean.replaceAll("\\s+", ""));
         List<String> lines = new ArrayList<>();
-        try (InputStream fis = new FileInputStream(file)) {
-            if (ext.equals("pdf")) {
-                try (PDDocument doc = Loader.loadPDF(file)) {
-                    PDFTextStripper stripper = new PDFTextStripper();
-                    for (String s : stripper.getText(doc).split("\\r?\\n")) if (!s.trim().isEmpty()) lines.add(s.trim());
-                }
-            } else if (ext.equals("docx") || ext.equals("doc")) {
-                try (XWPFDocument doc = new XWPFDocument(fis)) {
-                    for (IBodyElement el : doc.getBodyElements()) {
-                        if (el instanceof XWPFParagraph) {
-                            String t = ((XWPFParagraph) el).getText().trim();
-                            if (!t.isEmpty()) lines.add(t);
-                        } else if (el instanceof XWPFTable) {
-                            for (XWPFTableRow row : ((XWPFTable) el).getRows()) {
+
+        try (InputStream is = new ByteArrayInputStream(bytes)) {
+            if (ext.endsWith("docx")) {
+                try (XWPFDocument doc = new XWPFDocument(is)) {
+                    for (IBodyElement element : doc.getBodyElements()) {
+                        if (element instanceof XWPFParagraph) {
+                            String text = ((XWPFParagraph) element).getText();
+                            if (!text.trim().isEmpty()) lines.add(text.trim());
+                        } else if (element instanceof XWPFTable) {
+                            for (XWPFTableRow row : ((XWPFTable) element).getRows()) {
                                 StringBuilder sb = new StringBuilder();
-                                for (XWPFTableCell cell : row.getTableCells()) sb.append(cell.getText().trim()).append(" | ");
+                                for (XWPFTableCell cell : row.getTableCells()) {
+                                    sb.append(cell.getText().trim()).append(" | ");
+                                }
                                 lines.add(sb.toString().trim());
                             }
                         }
                     }
                 }
-            } else if (ext.startsWith("xls")) {
-                try (Workbook wb = WorkbookFactory.create(fis)) {
-                    Sheet s = wb.getSheetAt(0);
-                    for (Row r : s) {
+            } else if (ext.endsWith("xlsx")) {
+                try (Workbook wb = WorkbookFactory.create(is)) {
+                    Sheet sheet = wb.getSheetAt(0);
+                    for (Row row : sheet) {
                         StringBuilder sb = new StringBuilder();
-                        for (Cell c : r) sb.append(c.toString().trim()).append(" | ");
+                        for (Cell cell : row) {
+                            sb.append(cell.toString().trim()).append(" | ");
+                        }
                         if (sb.length() > 0) lines.add(sb.toString().trim());
                     }
                 }
+            } else if (ext.endsWith("pdf")) {
+                try (PDDocument pdf = Loader.loadPDF(bytes)) {
+                    PDFTextStripper stripper = new PDFTextStripper();
+                    String text = stripper.getText(pdf);
+                    for (String line : text.split("\\r?\\n")) {
+                        if (!line.trim().isEmpty()) lines.add(line.trim());
+                    }
+                }
             }
-        } finally { if (file != null) file.delete(); }
-        return lines;
-    }
-
-    private File downloadFile(String urlStr, String name) throws Exception {
-        URL url = new URL(urlStr);
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0");
-        File f = File.createTempFile("cmp_", "_" + name);
-        try (InputStream in = conn.getInputStream(); FileOutputStream out = new FileOutputStream(f)) {
-            byte[] buf = new byte[4096];
-            int len;
-            while ((len = in.read(buf)) != -1) out.write(buf, 0, len);
         }
-        return f;
-    }
-
-    private void disableSSL() throws Exception {
-        TrustManager[] trustAll = new TrustManager[]{
-            new X509TrustManager() {
-                public X509Certificate[] getAcceptedIssuers() { return null; }
-                public void checkClientTrusted(X509Certificate[] c, String a) {}
-                public void checkServerTrusted(X509Certificate[] c, String a) {}
-            }
-        };
-        SSLContext sc = SSLContext.getInstance("TLS");
-        sc.init(null, trustAll, new java.security.SecureRandom());
-        HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
-        HttpsURLConnection.setDefaultHostnameVerifier((h, s) -> true);
+        return lines;
     }
 
     static class DiffRow {
         String left, right, type;
-        DiffRow(String l, String r, String t) { 
-            this.left = l == null ? "" : l; 
-            this.right = r == null ? "" : r; 
-            this.type = t; 
+        DiffRow(String l, String r, String t) {
+            this.left = (l == null) ? "" : l;
+            this.right = (r == null) ? "" : r;
+            this.type = t;
         }
     }
 }
