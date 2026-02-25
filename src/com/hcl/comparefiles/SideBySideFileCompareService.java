@@ -24,7 +24,7 @@ import org.apache.pdfbox.text.PDFTextStripper;
 public class SideBySideFileCompareService implements JavaService2 {
 
     private static final Logger logger = Logger.getLogger(SideBySideFileCompareService.class);
-    private static final double SIMILARITY_THRESHOLD = 0.70; // Matches paragraph logic
+    private static final double SIMILARITY_THRESHOLD = 0.65; 
 
     @Override
     public Object invoke(String methodID, Object[] inputArray, DataControllerRequest request, DataControllerResponse response) {
@@ -42,18 +42,29 @@ public class SideBySideFileCompareService implements JavaService2 {
             List<String> leftLines = extractTextFromUrl(urlA, fileNameA);
             List<String> rightLines = extractTextFromUrl(urlB, fileNameB);
 
+            if (leftLines.equals(rightLines) && !leftLines.isEmpty()) {
+                result.addParam(new Param("isIdentical", "true"));
+                result.addParam(new Param("status", "SUCCESS"));
+                return result;
+            }
+
             List<DiffRow> finalRows = performPriorityAlignment(leftLines, rightLines);
+
+            int leftLineCounter = 1;
+            int rightLineCounter = 1;
 
             for (DiffRow row : finalRows) {
                 Record rec = new Record();
                 
-                // INLINE HIGHLIGHTING LOGIC
+                rec.addParam(new Param("leftLineNo", !row.type.equals("ADDED") ? String.valueOf(leftLineCounter++) : " "));
+                rec.addParam(new Param("rightLineNo", !row.type.equals("REMOVED") ? String.valueOf(rightLineCounter++) : " "));
+
                 if ("MODIFIED".equals(row.type)) {
                     rec.addParam(new Param("leftText", getInlineDiff(row.left, row.right, true)));
                     rec.addParam(new Param("rightText", getInlineDiff(row.left, row.right, false)));
                 } else {
-                    rec.addParam(new Param("leftText", row.left));
-                    rec.addParam(new Param("rightText", row.right));
+                    rec.addParam(new Param("leftText", escapeHtml(row.left)));
+                    rec.addParam(new Param("rightText", escapeHtml(row.right)));
                 }
                 
                 rec.addParam(new Param("diffType", row.type));
@@ -61,6 +72,7 @@ public class SideBySideFileCompareService implements JavaService2 {
             }
 
             result.addDataset(ds);
+            result.addParam(new Param("isIdentical", "false"));
             result.addParam(new Param("status", "SUCCESS"));
 
         } catch (Exception e) {
@@ -71,40 +83,36 @@ public class SideBySideFileCompareService implements JavaService2 {
         return result;
     }
 
-    /* ================= WORD-LEVEL HIGHLIGHTING ================= */
     private String getInlineDiff(String left, String right, boolean isOldSide) {
-        // Uses pipes for tables or spaces for paragraphs
         String delimiter = (left.contains("|")) ? "\\|" : "\\s+";
         String joiner = (left.contains("|")) ? " | " : " ";
-        
         String[] leftWords = left.split(delimiter);
         String[] rightWords = right.split(delimiter);
         
         Set<String> otherSide = new HashSet<>();
-        for (String w : (isOldSide ? rightWords : leftWords)) otherSide.add(w.trim());
+        for (String w : (isOldSide ? rightWords : leftWords)) otherSide.add(w.trim().toLowerCase());
 
         StringBuilder sb = new StringBuilder();
         String[] currentSide = isOldSide ? leftWords : rightWords;
-        
-        // Dark Red for deletions, Dark Green for additions
         String highlightColor = isOldSide ? "#C0392B" : "#27AE60"; 
 
         for (String word : currentSide) {
             String cleanWord = word.trim();
             if (cleanWord.isEmpty()) continue;
-
-            if (!otherSide.contains(cleanWord)) {
-                // Wrap specific modified words in font tags for RichText
-                sb.append("<b><font color='").append(highlightColor).append("'>")
-                  .append(cleanWord).append("</font></b>").append(joiner);
+            if (!otherSide.contains(cleanWord.toLowerCase())) {
+                sb.append("<b><font color='").append(highlightColor).append("'>").append(escapeHtml(cleanWord)).append("</font></b>").append(joiner);
             } else {
-                sb.append(cleanWord).append(joiner);
+                sb.append(escapeHtml(cleanWord)).append(joiner);
             }
         }
         return sb.toString().trim();
     }
 
-    /* ================= ALIGNMENT LOGIC ================= */
+    private String escapeHtml(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
     private List<DiffRow> performPriorityAlignment(List<String> a, List<String> b) {
         int m = a.size(), n = b.size();
         int[][] lcs = new int[m + 1][n + 1];
@@ -137,12 +145,12 @@ public class SideBySideFileCompareService implements JavaService2 {
 
     private double getSimilarity(String s1, String s2) {
         if (s1.isEmpty() || s2.isEmpty()) return 0;
+        // Table Alignment Boost: If it's a table row and the first column matches, boost similarity
         if (s1.contains("|") && s2.contains("|")) {
-            String prefix1 = s1.split("\\|")[0].trim();
-            String prefix2 = s2.split("\\|")[0].trim();
-            if (!prefix1.equals(prefix2)) return 0.0;
-        } else if (s1.contains("|") != s2.contains("|")) return 0.0;
-        
+            String p1 = s1.split("\\|")[0].trim();
+            String p2 = s2.split("\\|")[0].trim();
+            if (p1.equalsIgnoreCase(p2) && !p1.isEmpty()) return 0.8; 
+        }
         int distance = levenshteinDistance(s1, s2);
         return 1.0 - ((double) distance / Math.max(s1.length(), s2.length()));
     }
@@ -163,7 +171,6 @@ public class SideBySideFileCompareService implements JavaService2 {
         return costs[s2.length()];
     }
 
-    /* ================= EXTRACTION LOGIC ================= */
     private List<String> extractTextFromUrl(String urlStr, String fileName) throws Exception {
         File file = downloadFile(urlStr, fileName);
         String ext = fileName.substring(fileName.lastIndexOf('.') + 1).toLowerCase();
@@ -174,16 +181,20 @@ public class SideBySideFileCompareService implements JavaService2 {
                     PDFTextStripper stripper = new PDFTextStripper();
                     for (String s : stripper.getText(doc).split("\\r?\\n")) if (!s.trim().isEmpty()) lines.add(s.trim());
                 }
-            } else if (ext.equals("docx") || ext.equals("doc")) {
+            } else if (ext.startsWith("doc")) {
                 try (XWPFDocument doc = new XWPFDocument(fis)) {
                     for (IBodyElement el : doc.getBodyElements()) {
                         if (el instanceof XWPFParagraph) {
-                            String t = ((XWPFParagraph) el).getText().trim();
+                            String t = ((XWPFParagraph) el).getText().replaceAll("\\s+", " ").trim();
                             if (!t.isEmpty()) lines.add(t);
                         } else if (el instanceof XWPFTable) {
                             for (XWPFTableRow row : ((XWPFTable) el).getRows()) {
                                 StringBuilder sb = new StringBuilder();
-                                for (XWPFTableCell cell : row.getTableCells()) sb.append(cell.getText().trim()).append(" | ");
+                                List<XWPFTableCell> cells = row.getTableCells();
+                                for (int k = 0; k < cells.size(); k++) {
+                                    sb.append(cells.get(k).getText().replaceAll("\\s+", " ").trim());
+                                    if (k < cells.size() - 1) sb.append(" | ");
+                                }
                                 lines.add(sb.toString().trim());
                             }
                         }
@@ -191,10 +202,16 @@ public class SideBySideFileCompareService implements JavaService2 {
                 }
             } else if (ext.startsWith("xls")) {
                 try (Workbook wb = WorkbookFactory.create(fis)) {
+                    DataFormatter formatter = new DataFormatter();
                     Sheet s = wb.getSheetAt(0);
                     for (Row r : s) {
                         StringBuilder sb = new StringBuilder();
-                        for (Cell c : r) sb.append(c.toString().trim()).append(" | ");
+                        int lastCol = r.getLastCellNum();
+                        for (int cn = 0; cn < lastCol; cn++) {
+                            Cell c = r.getCell(cn, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                            sb.append(formatter.formatCellValue(c).replaceAll("\\s+", " ").trim());
+                            if (cn < lastCol - 1) sb.append(" | ");
+                        }
                         if (sb.length() > 0) lines.add(sb.toString().trim());
                     }
                 }
