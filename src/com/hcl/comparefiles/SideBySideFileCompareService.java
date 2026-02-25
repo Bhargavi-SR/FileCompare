@@ -14,17 +14,20 @@ import com.hcl.voltmx.middleware.controller.DataControllerRequest;
 import com.hcl.voltmx.middleware.controller.DataControllerResponse;
 import com.hcl.voltmx.middleware.dataobject.*;
 
-/* Apache POI & PDFBox */
+/* Apache POI, PDFBox, and PPTX */
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xwpf.usermodel.*;
+import org.apache.poi.xslf.usermodel.*; // Added for PPTX
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.poi.xslf.usermodel.*;
+//Avoid importing org.apache.poi.POIXMLDocument
 
 public class SideBySideFileCompareService implements JavaService2 {
 
     private static final Logger logger = Logger.getLogger(SideBySideFileCompareService.class);
-    private static final double SIMILARITY_THRESHOLD = 0.50; // Lowered to catch rows where only headers match
+    private static final double SIMILARITY_THRESHOLD = 0.50;
 
     @Override
     public Object invoke(String methodID, Object[] inputArray, DataControllerRequest request, DataControllerResponse response) {
@@ -32,6 +35,17 @@ public class SideBySideFileCompareService implements JavaService2 {
         Dataset ds = new Dataset("diffResults");
 
         try {
+            // DIAGNOSTIC: Log the POI version to verify if 5.2.5 is being used
+        	// Updated DIAGNOSTIC: Works in both POI 4.x and 5.x
+        	try {
+        	    // This class exists in both 4.1.2 and 5.2.5
+        	    String version = org.apache.poi.ss.usermodel.WorkbookFactory.class
+        	                     .getPackage().getImplementationVersion();
+        	    logger.info("Active POI Version: " + version);
+        	} catch (Exception e) {
+        	    logger.warn("POI Version Check Failed");
+        	}
+
             String urlA = request.getParameter("urlA");
             String urlB = request.getParameter("urlB");
             String fileNameA = request.getParameter("fileNameA");
@@ -55,7 +69,6 @@ public class SideBySideFileCompareService implements JavaService2 {
 
             for (DiffRow row : finalRows) {
                 Record rec = new Record();
-                
                 rec.addParam(new Param("leftLineNo", !row.type.equals("ADDED") ? String.valueOf(leftLineCounter++) : " "));
                 rec.addParam(new Param("rightLineNo", !row.type.equals("REMOVED") ? String.valueOf(rightLineCounter++) : " "));
 
@@ -78,45 +91,115 @@ public class SideBySideFileCompareService implements JavaService2 {
         } catch (Exception e) {
             logger.error("Error in SideBySideFileCompareService", e);
             result.addParam(new Param("status", "FAILED"));
-            result.addParam(new Param("errorMessage", e.getMessage()));
+            result.addParam(new Param("errorMessage", e.getClass().getName() + ": " + e.getMessage()));
         }
         return result;
     }
 
+    private List<String> extractTextFromUrl(String urlStr, String fileName) throws Exception {
+        File file = downloadFile(urlStr, fileName);
+        String ext = fileName.substring(fileName.lastIndexOf('.') + 1).toLowerCase();
+        List<String> lines = new ArrayList<>();
+        
+        try (InputStream fis = new FileInputStream(file)) {
+            if (ext.equals("pdf")) {
+                try (PDDocument doc = Loader.loadPDF(file)) {
+                    PDFTextStripper stripper = new PDFTextStripper();
+                    for (String s : stripper.getText(doc).split("\\r?\\n")) if (!s.trim().isEmpty()) lines.add(s.trim());
+                }
+            } else if (ext.equals("pptx")) {
+                // XMLSlideShow is the standard entry point for PPTX in 4.x and 5.x
+                try (XMLSlideShow ppt = new XMLSlideShow(fis)) {
+                    for (XSLFSlide slide : ppt.getSlides()) {
+                        for (XSLFShape shape : slide.getShapes()) {
+                            // 1. Extract from Text Boxes
+                            if (shape instanceof XSLFTextShape) {
+                                XSLFTextShape ts = (XSLFTextShape) shape;
+                                String text = ts.getText().trim();
+                                if (!text.isEmpty()) lines.add(text);
+                            } 
+                            // 2. Extract from Tables
+                            else if (shape instanceof XSLFTable) {
+                                XSLFTable table = (XSLFTable) shape;
+                                for (XSLFTableRow row : table.getRows()) {
+                                    StringBuilder rowSb = new StringBuilder();
+                                    List<XSLFTableCell> cells = row.getCells();
+                                    for (int i = 0; i < cells.size(); i++) {
+                                        rowSb.append(cells.get(i).getText().trim());
+                                        if (i < cells.size() - 1) rowSb.append(" | ");
+                                    }
+                                    if (rowSb.length() > 0) lines.add(rowSb.toString().trim());
+                                }
+                            }
+                        }
+                    }
+                }
+            }else if (ext.startsWith("doc")) {
+                try (XWPFDocument doc = new XWPFDocument(fis)) {
+                    for (IBodyElement el : doc.getBodyElements()) {
+                        if (el instanceof XWPFParagraph) {
+                            String t = ((XWPFParagraph) el).getText().replaceAll("\\s+", " ").trim();
+                            if (!t.isEmpty()) lines.add(t);
+                        } else if (el instanceof XWPFTable) {
+                            for (XWPFTableRow row : ((XWPFTable) el).getRows()) {
+                                StringBuilder sb = new StringBuilder();
+                                List<XWPFTableCell> cells = row.getTableCells();
+                                for (int k = 0; k < cells.size(); k++) {
+                                    sb.append(cells.get(k).getText().replaceAll("\\s+", " ").trim());
+                                    if (k < cells.size() - 1) sb.append(" | ");
+                                }
+                                lines.add(sb.toString().trim());
+                            }
+                        }
+                    }
+                }
+            } else if (ext.startsWith("xls")) {
+                try (Workbook wb = WorkbookFactory.create(fis)) {
+                    DataFormatter formatter = new DataFormatter();
+                    FormulaEvaluator evaluator = wb.getCreationHelper().createFormulaEvaluator();
+                    Sheet s = wb.getSheetAt(0);
+                    for (Row r : s) {
+                        StringBuilder sb = new StringBuilder();
+                        int lastCol = r.getLastCellNum();
+                        for (int cn = 0; cn < lastCol; cn++) {
+                            Cell c = r.getCell(cn, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                            String val = formatter.formatCellValue(c, evaluator).replaceAll("\\s+", " ").trim();
+                            sb.append(val);
+                            if (cn < lastCol - 1) sb.append(" | ");
+                        }
+                        if (sb.length() > 0) lines.add(sb.toString().trim());
+                    }
+                }
+            }
+        } finally { if (file != null && file.exists()) file.delete(); }
+        return lines;
+    }
+
+    // --- Keep existing helper methods (getInlineDiff, escapeHtml, performPriorityAlignment, etc.) ---
+    
     private String getInlineDiff(String left, String right, boolean isOldSide) {
         boolean isTable = left.contains("|") || right.contains("|");
         String delimiter = isTable ? "\\|" : "\\s+";
         String joiner = isTable ? " | " : " ";
-        
-        // Use -1 to keep trailing empty strings from split
         String[] leftParts = left.split(delimiter, -1);
         String[] rightParts = right.split(delimiter, -1);
-        
         int maxLen = Math.max(leftParts.length, rightParts.length);
         String[] currentSide = new String[maxLen];
         String[] otherSide = new String[maxLen];
-
-        // Pad arrays so they are the same length for index comparison
         for (int i = 0; i < maxLen; i++) {
             currentSide[i] = isOldSide ? (i < leftParts.length ? leftParts[i] : "") : (i < rightParts.length ? rightParts[i] : "");
             otherSide[i] = isOldSide ? (i < rightParts.length ? rightParts[i] : "") : (i < leftParts.length ? leftParts[i] : "");
         }
-
         StringBuilder sb = new StringBuilder();
         String highlightColor = isOldSide ? "#C0392B" : "#27AE60"; 
-
         for (int i = 0; i < maxLen; i++) {
             String val = currentSide[i].trim();
             String comp = otherSide[i].trim();
-            
-            boolean changed = !val.equalsIgnoreCase(comp);
-
-            if (changed && !val.isEmpty()) {
+            if (!val.equalsIgnoreCase(comp) && !val.isEmpty()) {
                 sb.append("<b><font color='").append(highlightColor).append("'>").append(escapeHtml(val)).append("</font></b>");
             } else {
                 sb.append(escapeHtml(val));
             }
-            
             if (i < maxLen - 1) sb.append(joiner);
         }
         return sb.toString().trim();
@@ -159,7 +242,6 @@ public class SideBySideFileCompareService implements JavaService2 {
 
     private double getSimilarity(String s1, String s2) {
         if (s1.isEmpty() || s2.isEmpty()) return 0;
-        // Stronger boost for Header column matching (e.g. "Point A")
         if (s1.contains("|") && s2.contains("|")) {
             String p1 = s1.split("\\|")[0].trim();
             String p2 = s2.split("\\|")[0].trim();
@@ -183,57 +265,6 @@ public class SideBySideFileCompareService implements JavaService2 {
             }
         }
         return costs[s2.length()];
-    }
-
-    private List<String> extractTextFromUrl(String urlStr, String fileName) throws Exception {
-        File file = downloadFile(urlStr, fileName);
-        String ext = fileName.substring(fileName.lastIndexOf('.') + 1).toLowerCase();
-        List<String> lines = new ArrayList<>();
-        try (InputStream fis = new FileInputStream(file)) {
-            if (ext.equals("pdf")) {
-                try (PDDocument doc = Loader.loadPDF(file)) {
-                    PDFTextStripper stripper = new PDFTextStripper();
-                    for (String s : stripper.getText(doc).split("\\r?\\n")) if (!s.trim().isEmpty()) lines.add(s.trim());
-                }
-            } else if (ext.startsWith("doc")) {
-                try (XWPFDocument doc = new XWPFDocument(fis)) {
-                    for (IBodyElement el : doc.getBodyElements()) {
-                        if (el instanceof XWPFParagraph) {
-                            String t = ((XWPFParagraph) el).getText().replaceAll("\\s+", " ").trim();
-                            if (!t.isEmpty()) lines.add(t);
-                        } else if (el instanceof XWPFTable) {
-                            for (XWPFTableRow row : ((XWPFTable) el).getRows()) {
-                                StringBuilder sb = new StringBuilder();
-                                List<XWPFTableCell> cells = row.getTableCells();
-                                for (int k = 0; k < cells.size(); k++) {
-                                    sb.append(cells.get(k).getText().replaceAll("\\s+", " ").trim());
-                                    if (k < cells.size() - 1) sb.append(" | ");
-                                }
-                                lines.add(sb.toString().trim());
-                            }
-                        }
-                    }
-                }
-            } else if (ext.startsWith("xls")) {
-                try (Workbook wb = WorkbookFactory.create(fis)) {
-                    DataFormatter formatter = new DataFormatter();
-                    FormulaEvaluator evaluator = wb.getCreationHelper().createFormulaEvaluator();
-                    Sheet s = wb.getSheetAt(0);
-                    for (Row r : s) {
-                        StringBuilder sb = new StringBuilder();
-                        int lastCol = r.getLastCellNum();
-                        for (int cn = 0; cn < lastCol; cn++) {
-                            Cell c = r.getCell(cn, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-                            String val = formatter.formatCellValue(c, evaluator).replaceAll("\\s+", " ").trim();
-                            sb.append(val);
-                            if (cn < lastCol - 1) sb.append(" | ");
-                        }
-                        if (sb.length() > 0) lines.add(sb.toString().trim());
-                    }
-                }
-            }
-        } finally { if (file != null) file.delete(); }
-        return lines;
     }
 
     private File downloadFile(String urlStr, String name) throws Exception {
