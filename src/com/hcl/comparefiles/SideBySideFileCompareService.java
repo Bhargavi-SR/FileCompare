@@ -108,17 +108,34 @@ public class SideBySideFileCompareService implements JavaService2 {
                     for (String s : stripper.getText(doc).split("\\r?\\n")) if (!s.trim().isEmpty()) lines.add(s.trim());
                 }
             } else if (ext.equals("pptx")) {
-                // XMLSlideShow is the standard entry point for PPTX in 4.x and 5.x
                 try (XMLSlideShow ppt = new XMLSlideShow(fis)) {
                     for (XSLFSlide slide : ppt.getSlides()) {
                         for (XSLFShape shape : slide.getShapes()) {
-                            // 1. Extract from Text Boxes
                             if (shape instanceof XSLFTextShape) {
                                 XSLFTextShape ts = (XSLFTextShape) shape;
-                                String text = ts.getText().trim();
-                                if (!text.isEmpty()) lines.add(text);
+                                StringBuilder shapeText = new StringBuilder();
+                                
+                                // Iterate through paragraphs to detect bullets
+                                for (XSLFTextParagraph para : ts.getTextParagraphs()) {
+                                    String bulletPrefix = "";
+                                    
+                                    // Check if this paragraph is part of a list
+                                    if (para.isBullet()) {
+                                        // You can customize the bullet character here (e.g., "• ", "- ", or "1. ")
+                                        bulletPrefix = "• "; 
+                                    }
+                                    
+                                    String paraText = para.getText().trim();
+                                    if (!paraText.isEmpty()) {
+                                        shapeText.append(bulletPrefix).append(paraText).append("\n");
+                                    }
+                                }
+                                
+                                String finalTxt = shapeText.toString().trim();
+                                if (!finalTxt.isEmpty()) lines.add(finalTxt);
+                                
                             } 
-                            // 2. Extract from Tables
+                         // 2. Extract from Tables
                             else if (shape instanceof XSLFTable) {
                                 XSLFTable table = (XSLFTable) shape;
                                 for (XSLFTableRow row : table.getRows()) {
@@ -134,7 +151,7 @@ public class SideBySideFileCompareService implements JavaService2 {
                         }
                     }
                 }
-            }else if (ext.startsWith("doc")) {
+            } else if (ext.startsWith("doc")) {
                 try (XWPFDocument doc = new XWPFDocument(fis)) {
                     for (IBodyElement el : doc.getBodyElements()) {
                         if (el instanceof XWPFParagraph) {
