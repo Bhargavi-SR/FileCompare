@@ -24,7 +24,7 @@ import org.apache.pdfbox.text.PDFTextStripper;
 public class SideBySideFileCompareService implements JavaService2 {
 
     private static final Logger logger = Logger.getLogger(SideBySideFileCompareService.class);
-    private static final double SIMILARITY_THRESHOLD = 0.65; 
+    private static final double SIMILARITY_THRESHOLD = 0.50; // Lowered to catch rows where only headers match
 
     @Override
     public Object invoke(String methodID, Object[] inputArray, DataControllerRequest request, DataControllerResponse response) {
@@ -84,26 +84,40 @@ public class SideBySideFileCompareService implements JavaService2 {
     }
 
     private String getInlineDiff(String left, String right, boolean isOldSide) {
-        String delimiter = (left.contains("|")) ? "\\|" : "\\s+";
-        String joiner = (left.contains("|")) ? " | " : " ";
-        String[] leftWords = left.split(delimiter);
-        String[] rightWords = right.split(delimiter);
+        boolean isTable = left.contains("|") || right.contains("|");
+        String delimiter = isTable ? "\\|" : "\\s+";
+        String joiner = isTable ? " | " : " ";
         
-        Set<String> otherSide = new HashSet<>();
-        for (String w : (isOldSide ? rightWords : leftWords)) otherSide.add(w.trim().toLowerCase());
+        // Use -1 to keep trailing empty strings from split
+        String[] leftParts = left.split(delimiter, -1);
+        String[] rightParts = right.split(delimiter, -1);
+        
+        int maxLen = Math.max(leftParts.length, rightParts.length);
+        String[] currentSide = new String[maxLen];
+        String[] otherSide = new String[maxLen];
+
+        // Pad arrays so they are the same length for index comparison
+        for (int i = 0; i < maxLen; i++) {
+            currentSide[i] = isOldSide ? (i < leftParts.length ? leftParts[i] : "") : (i < rightParts.length ? rightParts[i] : "");
+            otherSide[i] = isOldSide ? (i < rightParts.length ? rightParts[i] : "") : (i < leftParts.length ? leftParts[i] : "");
+        }
 
         StringBuilder sb = new StringBuilder();
-        String[] currentSide = isOldSide ? leftWords : rightWords;
         String highlightColor = isOldSide ? "#C0392B" : "#27AE60"; 
 
-        for (String word : currentSide) {
-            String cleanWord = word.trim();
-            if (cleanWord.isEmpty()) continue;
-            if (!otherSide.contains(cleanWord.toLowerCase())) {
-                sb.append("<b><font color='").append(highlightColor).append("'>").append(escapeHtml(cleanWord)).append("</font></b>").append(joiner);
+        for (int i = 0; i < maxLen; i++) {
+            String val = currentSide[i].trim();
+            String comp = otherSide[i].trim();
+            
+            boolean changed = !val.equalsIgnoreCase(comp);
+
+            if (changed && !val.isEmpty()) {
+                sb.append("<b><font color='").append(highlightColor).append("'>").append(escapeHtml(val)).append("</font></b>");
             } else {
-                sb.append(escapeHtml(cleanWord)).append(joiner);
+                sb.append(escapeHtml(val));
             }
+            
+            if (i < maxLen - 1) sb.append(joiner);
         }
         return sb.toString().trim();
     }
@@ -145,11 +159,11 @@ public class SideBySideFileCompareService implements JavaService2 {
 
     private double getSimilarity(String s1, String s2) {
         if (s1.isEmpty() || s2.isEmpty()) return 0;
-        // Table Alignment Boost: If it's a table row and the first column matches, boost similarity
+        // Stronger boost for Header column matching (e.g. "Point A")
         if (s1.contains("|") && s2.contains("|")) {
             String p1 = s1.split("\\|")[0].trim();
             String p2 = s2.split("\\|")[0].trim();
-            if (p1.equalsIgnoreCase(p2) && !p1.isEmpty()) return 0.8; 
+            if (p1.equalsIgnoreCase(p2) && !p1.isEmpty()) return 0.9; 
         }
         int distance = levenshteinDistance(s1, s2);
         return 1.0 - ((double) distance / Math.max(s1.length(), s2.length()));
@@ -203,13 +217,15 @@ public class SideBySideFileCompareService implements JavaService2 {
             } else if (ext.startsWith("xls")) {
                 try (Workbook wb = WorkbookFactory.create(fis)) {
                     DataFormatter formatter = new DataFormatter();
+                    FormulaEvaluator evaluator = wb.getCreationHelper().createFormulaEvaluator();
                     Sheet s = wb.getSheetAt(0);
                     for (Row r : s) {
                         StringBuilder sb = new StringBuilder();
                         int lastCol = r.getLastCellNum();
                         for (int cn = 0; cn < lastCol; cn++) {
                             Cell c = r.getCell(cn, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-                            sb.append(formatter.formatCellValue(c).replaceAll("\\s+", " ").trim());
+                            String val = formatter.formatCellValue(c, evaluator).replaceAll("\\s+", " ").trim();
+                            sb.append(val);
                             if (cn < lastCol - 1) sb.append(" | ");
                         }
                         if (sb.length() > 0) lines.add(sb.toString().trim());
