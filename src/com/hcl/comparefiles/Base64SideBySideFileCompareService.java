@@ -83,7 +83,7 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
         } catch (Exception e) {
             logger.error("Service Critical Failure", e);
             result.addParam(new Param("status", "FAILED"));
-            result.addParam(new Param("errorMessage", e.getMessage()));
+            result.addParam(new Param("errorMessage", "@@ failed: "+e.getMessage()));
         }
         return result;
     }
@@ -113,17 +113,28 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
                         }
                     }
                 }
+                return lines;
             } 
-            // FIXED: Added legacy .doc handler to prevent binary gibberish
-	        else if (ext.equals("doc")) {
-	            try (HWPFDocument doc = new HWPFDocument(is); 
-	                 WordExtractor extractor = new WordExtractor(doc)) {
-	                for (String p : extractor.getParagraphText()) {
-	                    if (p != null && !p.trim().isEmpty()) lines.add(p.trim());
-	                }
-	            }
-	        } 
-	        // PPTX Extraction with Image Handling
+        	// UPDATED: Legacy .doc handler
+            else if (nExt.contains("doc")) {
+                try (HWPFDocument doc = new HWPFDocument(is); 
+                     WordExtractor extractor = new WordExtractor(doc)) {
+                    
+                    String[] paragraphs = extractor.getParagraphText();
+                    for (String p : paragraphs) {
+                        if (p != null) {
+                            String cleanLine = p.replaceAll("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]", "").trim();
+                            if (!cleanLine.isEmpty()) {
+                                lines.add(cleanLine);
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    logger.error("Failed to parse legacy .doc file", e);
+                    throw new Exception("Legacy .doc parsing failed. Ensure file is not corrupted.");
+                }
+            }
+        	// PPTX Extraction with Image Handling
 	        else if (nExt.contains("pptx") || (isZip && nExt.isEmpty())) {
 	            try (XMLSlideShow ppt = new XMLSlideShow(is)) {
 	                for (XSLFSlide slide : ppt.getSlides()) {
