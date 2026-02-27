@@ -4,8 +4,13 @@ import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.*;
+import java.util.Base64;
 import javax.net.ssl.*;
 import java.security.cert.X509Certificate;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
+import javax.imageio.ImageIO;
 import org.apache.log4j.Logger;
 
 /* Volt MX Middleware */
@@ -14,20 +19,19 @@ import com.hcl.voltmx.middleware.controller.DataControllerRequest;
 import com.hcl.voltmx.middleware.controller.DataControllerResponse;
 import com.hcl.voltmx.middleware.dataobject.*;
 
-/* Apache POI, PDFBox, and PPTX */
+/* Apache POI & PDFBox */
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xwpf.usermodel.*;
-import org.apache.poi.xslf.usermodel.*; // Added for PPTX
+import org.apache.poi.xslf.usermodel.*;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
-import org.apache.poi.xslf.usermodel.*;
-//Avoid importing org.apache.poi.POIXMLDocument
 
 public class SideBySideFileCompareService implements JavaService2 {
 
     private static final Logger logger = Logger.getLogger(SideBySideFileCompareService.class);
     private static final double SIMILARITY_THRESHOLD = 0.50;
+    private static final int MAX_IMAGE_WIDTH = 400;
 
     @Override
     public Object invoke(String methodID, Object[] inputArray, DataControllerRequest request, DataControllerResponse response) {
@@ -35,17 +39,6 @@ public class SideBySideFileCompareService implements JavaService2 {
         Dataset ds = new Dataset("diffResults");
 
         try {
-            // DIAGNOSTIC: Log the POI version to verify if 5.2.5 is being used
-        	// Updated DIAGNOSTIC: Works in both POI 4.x and 5.x
-        	try {
-        	    // This class exists in both 4.1.2 and 5.2.5
-        	    String version = org.apache.poi.ss.usermodel.WorkbookFactory.class
-        	                     .getPackage().getImplementationVersion();
-        	    logger.info("Active POI Version: " + version);
-        	} catch (Exception e) {
-        	    logger.warn("POI Version Check Failed");
-        	}
-
             String urlA = request.getParameter("urlA");
             String urlB = request.getParameter("urlB");
             String fileNameA = request.getParameter("fileNameA");
@@ -56,12 +49,6 @@ public class SideBySideFileCompareService implements JavaService2 {
             List<String> leftLines = extractTextFromUrl(urlA, fileNameA);
             List<String> rightLines = extractTextFromUrl(urlB, fileNameB);
 
-            if (leftLines.equals(rightLines) && !leftLines.isEmpty()) {
-                result.addParam(new Param("isIdentical", "true"));
-                result.addParam(new Param("status", "SUCCESS"));
-                return result;
-            }
-
             List<DiffRow> finalRows = performPriorityAlignment(leftLines, rightLines);
 
             int leftLineCounter = 1;
@@ -69,29 +56,37 @@ public class SideBySideFileCompareService implements JavaService2 {
 
             for (DiffRow row : finalRows) {
                 Record rec = new Record();
+                
+                // IMAGE DETECTION & FORMATTING
+                if (row.left.startsWith("IMG_DATA:") || row.right.startsWith("IMG_DATA:")) {
+                    rec.addParam(new Param("isImage", "true"));
+                    rec.addParam(new Param("leftText", row.left.replace("IMG_DATA:", "")));
+                    rec.addParam(new Param("rightText", row.right.replace("IMG_DATA:", "")));
+                } else {
+                    rec.addParam(new Param("isImage", "false"));
+                    if ("MODIFIED".equals(row.type)) {
+                        rec.addParam(new Param("leftText", getInlineDiff(row.left, row.right, true)));
+                        rec.addParam(new Param("rightText", getInlineDiff(row.left, row.right, false)));
+                    } else {
+                        rec.addParam(new Param("leftText", escapeHtml(row.left)));
+                        rec.addParam(new Param("rightText", escapeHtml(row.right)));
+                    }
+                }
+
                 rec.addParam(new Param("leftLineNo", !row.type.equals("ADDED") ? String.valueOf(leftLineCounter++) : " "));
                 rec.addParam(new Param("rightLineNo", !row.type.equals("REMOVED") ? String.valueOf(rightLineCounter++) : " "));
-
-                if ("MODIFIED".equals(row.type)) {
-                    rec.addParam(new Param("leftText", getInlineDiff(row.left, row.right, true)));
-                    rec.addParam(new Param("rightText", getInlineDiff(row.left, row.right, false)));
-                } else {
-                    rec.addParam(new Param("leftText", escapeHtml(row.left)));
-                    rec.addParam(new Param("rightText", escapeHtml(row.right)));
-                }
-                
                 rec.addParam(new Param("diffType", row.type));
                 ds.addRecord(rec);
             }
 
             result.addDataset(ds);
-            result.addParam(new Param("isIdentical", "false"));
+            result.addParam(new Param("isIdentical", String.valueOf(leftLines.equals(rightLines))));
             result.addParam(new Param("status", "SUCCESS"));
 
         } catch (Exception e) {
             logger.error("Error in SideBySideFileCompareService", e);
             result.addParam(new Param("status", "FAILED"));
-            result.addParam(new Param("errorMessage", e.getClass().getName() + ": " + e.getMessage()));
+            result.addParam(new Param("errorMessage", e.getMessage()));
         }
         return result;
     }
@@ -112,40 +107,26 @@ public class SideBySideFileCompareService implements JavaService2 {
                     for (XSLFSlide slide : ppt.getSlides()) {
                         for (XSLFShape shape : slide.getShapes()) {
                             if (shape instanceof XSLFTextShape) {
-                                XSLFTextShape ts = (XSLFTextShape) shape;
-                                StringBuilder shapeText = new StringBuilder();
-                                
-                                // Iterate through paragraphs to detect bullets
-                                for (XSLFTextParagraph para : ts.getTextParagraphs()) {
-                                    String bulletPrefix = "";
-                                    
-                                    // Check if this paragraph is part of a list
-                                    if (para.isBullet()) {
-                                        // You can customize the bullet character here (e.g., "• ", "- ", or "1. ")
-                                        bulletPrefix = "• "; 
-                                    }
-                                    
-                                    String paraText = para.getText().trim();
-                                    if (!paraText.isEmpty()) {
-                                        shapeText.append(bulletPrefix).append(paraText).append("\n");
-                                    }
+                                for (XSLFTextParagraph para : ((XSLFTextShape) shape).getTextParagraphs()) {
+                                    String bullet = para.isBullet() ? "• " : "";
+                                    String txt = para.getText().trim();
+                                    if (!txt.isEmpty()) lines.add(bullet + txt);
                                 }
-                                
-                                String finalTxt = shapeText.toString().trim();
-                                if (!finalTxt.isEmpty()) lines.add(finalTxt);
-                                
-                            } 
-                         // 2. Extract from Tables
-                            else if (shape instanceof XSLFTable) {
-                                XSLFTable table = (XSLFTable) shape;
-                                for (XSLFTableRow row : table.getRows()) {
+                            } else if (shape instanceof XSLFPictureShape) {
+                                try {
+                                    XSLFPictureData data = ((XSLFPictureShape) shape).getPictureData();
+                                    byte[] resized = resizeImage(data.getData(), MAX_IMAGE_WIDTH);
+                                    lines.add("IMG_DATA:image/jpeg;base64," + Base64.getEncoder().encodeToString(resized));
+                                } catch (Exception imgEx) {
+                                    logger.warn("Image skip: " + imgEx.getMessage());
+                                }
+                            } else if (shape instanceof XSLFTable) {
+                                for (XSLFTableRow row : ((XSLFTable) shape).getRows()) {
                                     StringBuilder rowSb = new StringBuilder();
-                                    List<XSLFTableCell> cells = row.getCells();
-                                    for (int i = 0; i < cells.size(); i++) {
-                                        rowSb.append(cells.get(i).getText().trim());
-                                        if (i < cells.size() - 1) rowSb.append(" | ");
+                                    for (XSLFTableCell cell : row.getCells()) {
+                                        rowSb.append(cell.getText().replace("\n", " ").trim()).append(" | ");
                                     }
-                                    if (rowSb.length() > 0) lines.add(rowSb.toString().trim());
+                                    lines.add(rowSb.toString().trim());
                                 }
                             }
                         }
@@ -155,15 +136,13 @@ public class SideBySideFileCompareService implements JavaService2 {
                 try (XWPFDocument doc = new XWPFDocument(fis)) {
                     for (IBodyElement el : doc.getBodyElements()) {
                         if (el instanceof XWPFParagraph) {
-                            String t = ((XWPFParagraph) el).getText().replaceAll("\\s+", " ").trim();
+                            String t = ((XWPFParagraph) el).getText().trim();
                             if (!t.isEmpty()) lines.add(t);
                         } else if (el instanceof XWPFTable) {
                             for (XWPFTableRow row : ((XWPFTable) el).getRows()) {
                                 StringBuilder sb = new StringBuilder();
-                                List<XWPFTableCell> cells = row.getTableCells();
-                                for (int k = 0; k < cells.size(); k++) {
-                                    sb.append(cells.get(k).getText().replaceAll("\\s+", " ").trim());
-                                    if (k < cells.size() - 1) sb.append(" | ");
+                                for (XWPFTableCell cell : row.getTableCells()) {
+                                    sb.append(cell.getText().replace("\n", " ").trim()).append(" | ");
                                 }
                                 lines.add(sb.toString().trim());
                             }
@@ -172,59 +151,75 @@ public class SideBySideFileCompareService implements JavaService2 {
                 }
             } else if (ext.startsWith("xls")) {
                 try (Workbook wb = WorkbookFactory.create(fis)) {
-                    DataFormatter formatter = new DataFormatter();
-                    FormulaEvaluator evaluator = wb.getCreationHelper().createFormulaEvaluator();
+                                DataFormatter formatter = new DataFormatter();
+                                FormulaEvaluator evaluator = wb.getCreationHelper().createFormulaEvaluator();
                     Sheet s = wb.getSheetAt(0);
+                              // DataFormatter df = new DataFormatter();
                     for (Row r : s) {
                         StringBuilder sb = new StringBuilder();
-                        int lastCol = r.getLastCellNum();
-                        for (int cn = 0; cn < lastCol; cn++) {
-                            Cell c = r.getCell(cn, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-                            String val = formatter.formatCellValue(c, evaluator).replaceAll("\\s+", " ").trim();
-                            sb.append(val);
-                            if (cn < lastCol - 1) sb.append(" | ");
-                        }
+                                    int lastCol = r.getLastCellNum();
+                                    for (int cn = 0; cn < lastCol; cn++) {
+                                        Cell c = r.getCell(cn, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                                        String val = formatter.formatCellValue(c, evaluator).replaceAll("\\s+", " ").trim();
+                                        sb.append(val);
+                                        if (cn < lastCol - 1) sb.append(" | ");
+                                    }
+                                  // for (Cell c : r) sb.append(df.formatCellValue(c)).append(" | ");
                         if (sb.length() > 0) lines.add(sb.toString().trim());
                     }
                 }
             }
-        } finally { if (file != null && file.exists()) file.delete(); }
+        } finally { 
+            if (file != null && file.exists()) file.delete(); 
+        }
         return lines;
     }
 
-    // --- Keep existing helper methods (getInlineDiff, escapeHtml, performPriorityAlignment, etc.) ---
-    
-    private String getInlineDiff(String left, String right, boolean isOldSide) {
-        boolean isTable = left.contains("|") || right.contains("|");
-        String delimiter = isTable ? "\\|" : "\\s+";
-        String joiner = isTable ? " | " : " ";
-        String[] leftParts = left.split(delimiter, -1);
-        String[] rightParts = right.split(delimiter, -1);
-        int maxLen = Math.max(leftParts.length, rightParts.length);
-        String[] currentSide = new String[maxLen];
-        String[] otherSide = new String[maxLen];
-        for (int i = 0; i < maxLen; i++) {
-            currentSide[i] = isOldSide ? (i < leftParts.length ? leftParts[i] : "") : (i < rightParts.length ? rightParts[i] : "");
-            otherSide[i] = isOldSide ? (i < rightParts.length ? rightParts[i] : "") : (i < leftParts.length ? leftParts[i] : "");
+    private byte[] resizeImage(byte[] originalData, int maxWidth) throws Exception {
+        try (InputStream in = new ByteArrayInputStream(originalData)) {
+            BufferedImage originalImage = ImageIO.read(in);
+            if (originalImage == null) return originalData;
+            int width = originalImage.getWidth();
+            int height = originalImage.getHeight();
+            if (width <= maxWidth) return originalData;
+            int newHeight = (maxWidth * height) / width;
+            BufferedImage resized = new BufferedImage(maxWidth, newHeight, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g = resized.createGraphics();
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.drawImage(originalImage, 0, 0, maxWidth, newHeight, null);
+            g.dispose();
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            ImageIO.write(resized, "jpg", baos);
+            return baos.toByteArray();
         }
+    }
+
+    private String getInlineDiff(String left, String right, boolean isOldSide) {
+        String delimiter = left.contains("|") ? "\\|" : "\\s+";
+        String joiner = left.contains("|") ? " | " : " ";
+        String[] lWords = left.split(delimiter, -1);
+        String[] rWords = right.split(delimiter, -1);
+        Set<String> otherSide = new HashSet<>();
+        for (String w : (isOldSide ? rWords : lWords)) otherSide.add(w.trim().toLowerCase());
+
         StringBuilder sb = new StringBuilder();
-        String highlightColor = isOldSide ? "#C0392B" : "#27AE60"; 
-        for (int i = 0; i < maxLen; i++) {
-            String val = currentSide[i].trim();
-            String comp = otherSide[i].trim();
-            if (!val.equalsIgnoreCase(comp) && !val.isEmpty()) {
-                sb.append("<b><font color='").append(highlightColor).append("'>").append(escapeHtml(val)).append("</font></b>");
+        String[] currentSide = isOldSide ? lWords : rWords;
+        String color = isOldSide ? "#C0392B" : "#27AE60"; 
+
+        for (String word : currentSide) {
+            if (word.trim().isEmpty()) { sb.append(joiner); continue; }
+            if (!otherSide.contains(word.trim().toLowerCase())) {
+                sb.append("<b><font color='").append(color).append("'>").append(escapeHtml(word.trim())).append("</font></b>").append(joiner);
             } else {
-                sb.append(escapeHtml(val));
+                sb.append(escapeHtml(word.trim())).append(joiner);
             }
-            if (i < maxLen - 1) sb.append(joiner);
         }
         return sb.toString().trim();
     }
 
     private String escapeHtml(String s) {
         if (s == null) return "";
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&apos;");
     }
 
     private List<DiffRow> performPriorityAlignment(List<String> a, List<String> b) {
@@ -258,12 +253,7 @@ public class SideBySideFileCompareService implements JavaService2 {
     }
 
     private double getSimilarity(String s1, String s2) {
-        if (s1.isEmpty() || s2.isEmpty()) return 0;
-        if (s1.contains("|") && s2.contains("|")) {
-            String p1 = s1.split("\\|")[0].trim();
-            String p2 = s2.split("\\|")[0].trim();
-            if (p1.equalsIgnoreCase(p2) && !p1.isEmpty()) return 0.9; 
-        }
+        if (s1.isEmpty() || s2.isEmpty() || s1.startsWith("IMG_DATA") || s2.startsWith("IMG_DATA")) return 0;
         int distance = levenshteinDistance(s1, s2);
         return 1.0 - ((double) distance / Math.max(s1.length(), s2.length()));
     }
