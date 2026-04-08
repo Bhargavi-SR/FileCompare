@@ -15,22 +15,22 @@ import com.hcl.voltmx.middleware.controller.DataControllerRequest;
 import com.hcl.voltmx.middleware.controller.DataControllerResponse;
 import com.hcl.voltmx.middleware.dataobject.*;
 
-/* Apache POI & PDFBox */
-import org.apache.poi.xslf.usermodel.*;
 import org.apache.poi.xwpf.usermodel.*;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.hwpf.HWPFDocument;
 import org.apache.poi.hwpf.extractor.WordExtractor;
+
+/* PDFBox 3.x (Latest) */
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 
+import org.apache.poi.xslf.usermodel.*;
+
 public class Base64SideBySideFileCompareService implements JavaService2 {
 
     private static final Logger logger = Logger.getLogger(Base64SideBySideFileCompareService.class);
-    private static final double SIMILARITY_THRESHOLD = 0.65;
-    private static final int MAX_IMAGE_WIDTH = 400; // Optimal for mobile display
-
+    private static final double SIMILARITY_THRESHOLD = 0.60;
     @Override
     public Object invoke(String methodID, Object[] inputArray, DataControllerRequest request, DataControllerResponse response) {
         Result result = new Result();
@@ -53,8 +53,6 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
             for (DiffRow row : finalRows) {
                 if (!"UNCHANGED".equals(row.type)) hasChanges = true;
                 Record rec = new Record();
-                
-                // IMAGE DETECTION LOGIC
                 if (row.left.startsWith("IMG_DATA:") || row.right.startsWith("IMG_DATA:")) {
                     rec.addParam(new Param("isImage", "true"));
                     rec.addParam(new Param("leftText", row.left.replace("IMG_DATA:", "")));
@@ -69,7 +67,6 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
                         rec.addParam(new Param("rightText", escapeHtml(row.right)));
                     }
                 }
-
                 rec.addParam(new Param("leftLineNo", row.leftNo > 0 ? String.valueOf(row.leftNo) : ""));
                 rec.addParam(new Param("rightLineNo", row.rightNo > 0 ? String.valueOf(row.rightNo) : ""));
                 rec.addParam(new Param("diffType", row.type));
@@ -78,12 +75,12 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
 
             result.addDataset(ds);
             result.addParam(new Param("status", "SUCCESS"));
-            result.addParam(new Param("isIdentical", String.valueOf(!hasChanges)));
+//            result.addParam(new Param("isIdentical", String.valueOf(!hasChanges)));
 
-        } catch (Exception e) {
+        } catch (Throwable e) {
             logger.error("Service Critical Failure", e);
             result.addParam(new Param("status", "FAILED"));
-            result.addParam(new Param("errorMessage", "@@ failed: "+e.getMessage()));
+            result.addParam(new Param("errorMessage", "Error: " + e.getMessage()));
         }
         return result;
     }
@@ -93,138 +90,148 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
         byte[] bytes = Base64.getDecoder().decode(cleanB64.replaceAll("\\s+", ""));
         List<String> lines = new ArrayList<>();
         String nExt = (ext == null) ? "" : ext.toLowerCase().trim();
-        boolean isZip = (bytes.length > 2 && bytes[0] == 0x50 && bytes[1] == 0x4B);
-
         try (InputStream is = new ByteArrayInputStream(bytes)) {
-        	if (ext.endsWith("docx")) {
-                try (XWPFDocument doc = new XWPFDocument(is)) {
-                    for (IBodyElement element : doc.getBodyElements()) {
-                        if (element instanceof XWPFParagraph) {
-                            String text = ((XWPFParagraph) element).getText();
-                            if (text != null && !text.trim().isEmpty()) lines.add(text.trim());
-                        } else if (element instanceof XWPFTable) {
-                            for (XWPFTableRow row : ((XWPFTable) element).getRows()) {
-                                StringBuilder sb = new StringBuilder();
-                                for (XWPFTableCell cell : row.getTableCells()) {
-                                    sb.append(cell.getText().replace("\n", " ").trim()).append(" | ");
+        	if (nExt.endsWith("docx")) {
+        	    try (XWPFDocument doc = new XWPFDocument(is)) {
+        	        for (IBodyElement element : doc.getBodyElements()) {
+        	            if (element instanceof XWPFParagraph) {
+        	                String text = ((XWPFParagraph) element).getText();
+        	                if (text != null && !text.trim().isEmpty()) lines.add(text.trim());
+        	            } else if (element instanceof XWPFTable) {
+        	                XWPFTable table = (XWPFTable) element;
+        	                int maxCols = 0;
+        	                for (XWPFTableRow row : table.getRows()) {
+        	                    maxCols = Math.max(maxCols, row.getTableCells().size());
+        	                }
+        	                for (XWPFTableRow row : table.getRows()) {
+        	                    StringBuilder sb = new StringBuilder();
+        	                    List<XWPFTableCell> cells = row.getTableCells();
+        	                    for (XWPFTableCell cell : cells) {
+        	                        String cellText = cell.getText().replace("\n", " ").trim();
+        	                        sb.append(cellText).append(" | ");
+        	                    }
+        	                    for (int i = cells.size(); i < maxCols; i++) {
+        	                        sb.append("  | "); 
+        	                    }
+        	                    lines.add(sb.toString().trim());
+        	                }
+        	            }
+        	        }
+        	    }
+        	}
+        	else if (nExt.endsWith("doc")) {
+                try {
+                    try (InputStream docIs = new ByteArrayInputStream(bytes);
+                         HWPFDocument doc = new HWPFDocument(docIs);
+                         WordExtractor extractor = new WordExtractor(doc)) {
+                        
+                        String[] paragraphs = extractor.getParagraphText();
+                        for (String p : paragraphs) {
+                            if (p != null) {
+                                // Removes low-level binary control characters
+                                String cleanLine = p.replaceAll("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]", "").trim();
+                                if (!cleanLine.isEmpty()) {
+                                    lines.add(cleanLine);
                                 }
-                                lines.add(sb.toString().trim());
                             }
                         }
                     }
-                }
-                return lines;
-            } 
-        	// UPDATED: Legacy .doc handler
-            else if (nExt.contains("doc")) {
-                try (HWPFDocument doc = new HWPFDocument(is); 
-                     WordExtractor extractor = new WordExtractor(doc)) {
-                    
-                    String[] paragraphs = extractor.getParagraphText();
-                    for (String p : paragraphs) {
-                        if (p != null) {
-                            String cleanLine = p.replaceAll("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]", "").trim();
-                            if (!cleanLine.isEmpty()) {
-                                lines.add(cleanLine);
-                            }
-                        }
-                    }
-                } catch (Exception e) {
+                } catch (Throwable e) {
                     logger.error("Failed to parse legacy .doc file", e);
-                    throw new Exception("Legacy .doc parsing failed. Ensure file is not corrupted.");
+                    throw new Exception("File identified as .doc but failed to parse. Check poi-scratchpad jar."+e);
+                }
+            }else if (nExt.contains("xls")) {
+                try (Workbook wb = WorkbookFactory.create(is)) {
+                    DataFormatter formatter = new DataFormatter();
+                    FormulaEvaluator evaluator = wb.getCreationHelper().createFormulaEvaluator();
+                    for (int i = 0; i < wb.getNumberOfSheets(); i++) {
+                        Sheet sheet = wb.getSheetAt(i);
+                        String sheetName = sheet.getSheetName();
+                        if (i > 0) {
+                            lines.add(""); 
+                        }
+                        lines.add("--- SHEET: " + sheetName.toUpperCase() + " ---");
+                        for (Row row : sheet) {
+                            StringBuilder sb = new StringBuilder();
+                            sb.append("[").append(sheetName).append("] ");
+                            for (Cell cell : row) {
+                                if (cell != null) {
+                                String cellValue = formatter.formatCellValue(cell, evaluator).trim();
+                                if (!cellValue.isEmpty()) {
+                                    sb.append(cellValue).append(" | ");
+                                }
+                                }
+                            }
+                            String finalLine = sb.toString().trim();
+                           if (finalLine.endsWith("|")) {
+                               finalLine = finalLine.substring(0, finalLine.length() - 1).trim();
+                           }
+                           if (finalLine.length() > (sheetName.length() + 3)) {
+                               lines.add(finalLine);
+                               }
+                        }
+                    }
                 }
             }
-        	// PPTX Extraction with Image Handling
-	        else if (nExt.contains("pptx") || (isZip && nExt.isEmpty())) {
-	            try (XMLSlideShow ppt = new XMLSlideShow(is)) {
-	                for (XSLFSlide slide : ppt.getSlides()) {
-	                    for (XSLFShape shape : slide.getShapes()) {
-	                        if (shape instanceof XSLFTextShape) {
-	                            for (XSLFTextParagraph p : ((XSLFTextShape) shape).getTextParagraphs()) {
-	                                String bullet = p.isBullet() ? "• " : "";
-	                                if (!p.getText().trim().isEmpty()) lines.add(bullet + p.getText().trim());
-	                            }
-	                        } else if (shape instanceof XSLFPictureShape) {
-	                            try {
-	                                XSLFPictureData data = ((XSLFPictureShape) shape).getPictureData();
-	                                byte[] resized = resizeImage(data.getData(), MAX_IMAGE_WIDTH);
-	                                lines.add("IMG_DATA:image/jpeg;base64," + Base64.getEncoder().encodeToString(resized));
-	                            } catch (Exception imgEx) {
-	                                logger.warn("Image resize failed", imgEx);
-	                            }
-	                        } else if (shape instanceof XSLFTable) {
-	                            for (XSLFTableRow row : ((XSLFTable) shape).getRows()) {
-	                                StringBuilder rowSb = new StringBuilder();
-	                                for (XSLFTableCell cell : row.getCells()) {
-	                                    rowSb.append(cell.getText().replace("\n", " ").trim()).append(" | ");
-	                                }
-	                                lines.add(rowSb.toString().trim());
-	                            }
-	                        }
-	                    }
-	                }
-	            }
-	        }else if (ext.contains("xls")) {
-	                    try (Workbook wb = WorkbookFactory.create(is)) {
-	                        Sheet sheet = wb.getSheetAt(0);
-	                        DataFormatter formatter = new DataFormatter();
-	                        FormulaEvaluator evaluator = wb.getCreationHelper().createFormulaEvaluator();
-	                        for (Row row : sheet) {
-	                            StringBuilder sb = new StringBuilder();
-	                            for (Cell cell : row) {
-	                                sb.append(formatter.formatCellValue(cell, evaluator)).append(" | ");
-	                            }
-	                            if (sb.length() > 0) lines.add(sb.toString().trim());
-	                        }
-	                    }
-	                } else if (ext.endsWith("pdf")) {
-	                    try (PDDocument pdf = Loader.loadPDF(bytes)) {
-	                        String text = new PDFTextStripper().getText(pdf);
-	                        for (String line : text.split("\\r?\\n")) {
-	                            if (!line.trim().isEmpty()) lines.add(line.trim());
-	                        }
-	                    }
-	                } else {
-	                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"))) {
-	                        String line;
-	                        while ((line = reader.readLine()) != null) {
-	                            if (line.trim().isEmpty()) continue;
-	                            if (ext.contains("csv")) {
-	                                String[] parts = line.split(",", -1);
-	                                StringBuilder sb = new StringBuilder();
-	                                for (String p : parts) sb.append(p.trim().isEmpty() ? " " : p.trim()).append(" | ");
-	                                lines.add(sb.toString().trim());
-	                            } else lines.add(line.trim());
-	                        }
-	                    }
-	                }
-	            }
-	        return lines;
-	}
+            else if (nExt.endsWith("pdf")) {
+                try (PDDocument pdf = Loader.loadPDF(bytes)) {
+                    PDFTextStripper stripper = new PDFTextStripper();
+                    String text = stripper.getText(pdf);
+                    for (String line : text.split("\\r?\\n")) {
+                        if (!line.trim().isEmpty()) lines.add(line.trim());
+                    }
+                }
+            }
+            else if (nExt.contains("pptx")) {
+                try (XMLSlideShow ppt = new XMLSlideShow(is)) {
+                    for (XSLFSlide slide : ppt.getSlides()) {
+                    	lines.add("");
+                        lines.add("SHEET_HEADER:Slide " + (slide.getSlideNumber()));
+                        for (XSLFShape shape : slide.getShapes()) {
+                            if (shape instanceof XSLFTextShape) {
+                                String text = ((XSLFTextShape) shape).getText().trim();
+                                if (!text.isEmpty()) lines.add(text);
+                            } 
+                            else if (shape instanceof XSLFPictureShape) {
+                                XSLFPictureData data = ((XSLFPictureShape) shape).getPictureData();
+                                byte[] resized = resizeImage(data.getData(), 400); 
+                                lines.add("IMG_DATA:image/jpeg;base64," + Base64.getEncoder().encodeToString(resized));
+                            }
+                        }
+                    }
+                }
+            }
+            else {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (!line.trim().isEmpty()) lines.add(line.trim());
+                    }
+                }
+            }
+        }
+        return lines;
+    }
 
     private byte[] resizeImage(byte[] originalData, int maxWidth) throws Exception {
         try (InputStream in = new ByteArrayInputStream(originalData)) {
             BufferedImage originalImage = ImageIO.read(in);
             if (originalImage == null) return originalData;
-
             int width = originalImage.getWidth();
             int height = originalImage.getHeight();
             if (width <= maxWidth) return originalData;
-
             int newHeight = (maxWidth * height) / width;
             BufferedImage resized = new BufferedImage(maxWidth, newHeight, BufferedImage.TYPE_INT_RGB);
             Graphics2D g = resized.createGraphics();
             g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
             g.drawImage(originalImage, 0, 0, maxWidth, newHeight, null);
             g.dispose();
-
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            ImageIO.write(resized, "jpg", baos); // JPEG is much smaller for Base64
+            ImageIO.write(resized, "jpg", baos);
             return baos.toByteArray();
         }
     }
 
-    // --- LCS Alignment Algorithm ---
     private List<DiffRow> performAlignment(List<String> a, List<String> b) {
         int m = a.size(), n = b.size();
         int[][] lcs = new int[m + 1][n + 1];
@@ -284,11 +291,9 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
         String[] rWords = right.split(delimiter, -1);
         Set<String> otherSide = new HashSet<>();
         for (String w : (isOldSide ? rWords : lWords)) otherSide.add(w.trim().toLowerCase());
-
         StringBuilder sb = new StringBuilder();
         String[] currentSide = isOldSide ? lWords : rWords;
         String color = isOldSide ? "#C0392B" : "#27AE60"; 
-
         for (String word : currentSide) {
             if (word.trim().isEmpty()) { sb.append(joiner); continue; }
             if (!otherSide.contains(word.trim().toLowerCase())) {

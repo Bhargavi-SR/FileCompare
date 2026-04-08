@@ -4,7 +4,6 @@ import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.*;
-import java.util.Base64;
 import javax.net.ssl.*;
 import java.security.cert.X509Certificate;
 import java.awt.Graphics2D;
@@ -19,10 +18,14 @@ import com.hcl.voltmx.middleware.controller.DataControllerRequest;
 import com.hcl.voltmx.middleware.controller.DataControllerResponse;
 import com.hcl.voltmx.middleware.dataobject.*;
 
-/* Apache POI & PDFBox */
+/* Apache POI 4.1.2 */
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xwpf.usermodel.*;
 import org.apache.poi.xslf.usermodel.*;
+import org.apache.poi.hwpf.HWPFDocument;
+import org.apache.poi.hwpf.extractor.WordExtractor;
+
+/* PDFBox 3.x (Modern) */
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
@@ -57,12 +60,14 @@ public class SideBySideFileCompareService implements JavaService2 {
             for (DiffRow row : finalRows) {
                 Record rec = new Record();
                 
-                // IMAGE DETECTION & FORMATTING
+                // 1. IMAGE DETECTION
                 if (row.left.startsWith("IMG_DATA:") || row.right.startsWith("IMG_DATA:")) {
                     rec.addParam(new Param("isImage", "true"));
                     rec.addParam(new Param("leftText", row.left.replace("IMG_DATA:", "")));
                     rec.addParam(new Param("rightText", row.right.replace("IMG_DATA:", "")));
-                } else {
+                } 
+                // 2. TEXT COMPARISON
+                else {
                     rec.addParam(new Param("isImage", "false"));
                     if ("MODIFIED".equals(row.type)) {
                         rec.addParam(new Param("leftText", getInlineDiff(row.left, row.right, true)));
@@ -80,7 +85,7 @@ public class SideBySideFileCompareService implements JavaService2 {
             }
 
             result.addDataset(ds);
-            result.addParam(new Param("isIdentical", String.valueOf(leftLines.equals(rightLines))));
+//            result.addParam(new Param("isIdentical", String.valueOf(leftLines.equals(rightLines))));
             result.addParam(new Param("status", "SUCCESS"));
 
         } catch (Exception e) {
@@ -93,85 +98,128 @@ public class SideBySideFileCompareService implements JavaService2 {
 
     private List<String> extractTextFromUrl(String urlStr, String fileName) throws Exception {
         File file = downloadFile(urlStr, fileName);
-        String ext = fileName.substring(fileName.lastIndexOf('.') + 1).toLowerCase();
+        String ext = (fileName != null && fileName.contains(".")) ? 
+                     fileName.substring(fileName.lastIndexOf('.') + 1).toLowerCase() : "";
         List<String> lines = new ArrayList<>();
         
         try (InputStream fis = new FileInputStream(file)) {
+            // PDF 3.x
             if (ext.equals("pdf")) {
                 try (PDDocument doc = Loader.loadPDF(file)) {
                     PDFTextStripper stripper = new PDFTextStripper();
-                    for (String s : stripper.getText(doc).split("\\r?\\n")) if (!s.trim().isEmpty()) lines.add(s.trim());
+                    for (String s : stripper.getText(doc).split("\\r?\\n")) {
+                        if (!s.trim().isEmpty()) lines.add(s.trim());
+                    }
                 }
-            } else if (ext.equals("pptx")) {
+            } 
+            // PPTX 4.x
+            else if (ext.equals("pptx")) {
                 try (XMLSlideShow ppt = new XMLSlideShow(fis)) {
                     for (XSLFSlide slide : ppt.getSlides()) {
+                    	lines.add("");
+                        lines.add("SHEET_HEADER:Slide " + (slide.getSlideNumber()));
                         for (XSLFShape shape : slide.getShapes()) {
                             if (shape instanceof XSLFTextShape) {
                                 for (XSLFTextParagraph para : ((XSLFTextShape) shape).getTextParagraphs()) {
-                                    String bullet = para.isBullet() ? "• " : "";
                                     String txt = para.getText().trim();
-                                    if (!txt.isEmpty()) lines.add(bullet + txt);
+                                    if (!txt.isEmpty()) lines.add(txt);
                                 }
                             } else if (shape instanceof XSLFPictureShape) {
                                 try {
                                     XSLFPictureData data = ((XSLFPictureShape) shape).getPictureData();
                                     byte[] resized = resizeImage(data.getData(), MAX_IMAGE_WIDTH);
                                     lines.add("IMG_DATA:image/jpeg;base64," + Base64.getEncoder().encodeToString(resized));
-                                } catch (Exception imgEx) {
-                                    logger.warn("Image skip: " + imgEx.getMessage());
-                                }
-                            } else if (shape instanceof XSLFTable) {
-                                for (XSLFTableRow row : ((XSLFTable) shape).getRows()) {
-                                    StringBuilder rowSb = new StringBuilder();
-                                    for (XSLFTableCell cell : row.getCells()) {
-                                        rowSb.append(cell.getText().replace("\n", " ").trim()).append(" | ");
-                                    }
-                                    lines.add(rowSb.toString().trim());
-                                }
+                                } catch (Exception imgEx) { logger.warn("Image resize failed"); }
                             }
                         }
                     }
                 }
-            } else if (ext.startsWith("doc")) {
-                try (XWPFDocument doc = new XWPFDocument(fis)) {
-                    for (IBodyElement el : doc.getBodyElements()) {
-                        if (el instanceof XWPFParagraph) {
-                            String t = ((XWPFParagraph) el).getText().trim();
-                            if (!t.isEmpty()) lines.add(t);
-                        } else if (el instanceof XWPFTable) {
-                            for (XWPFTableRow row : ((XWPFTable) el).getRows()) {
-                                StringBuilder sb = new StringBuilder();
-                                for (XWPFTableCell cell : row.getTableCells()) {
-                                    sb.append(cell.getText().replace("\n", " ").trim()).append(" | ");
+            } else if (ext.startsWith("doc")){
+            	// UPDATED: Legacy .doc handler
+                 if (ext.endsWith("doc")) {
+                    try (HWPFDocument doc = new HWPFDocument(fis); 
+                         WordExtractor extractor = new WordExtractor(doc)) {
+                        
+                        String[] paragraphs = extractor.getParagraphText();
+                        for (String p : paragraphs) {
+                            if (p != null) {
+                                String cleanLine = p.replaceAll("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]", "").trim();
+                                if (!cleanLine.isEmpty()) {
+                                    lines.add(cleanLine);
                                 }
-                                lines.add(sb.toString().trim());
                             }
                         }
+                    } catch (Exception e) {
+                        logger.error("Failed to parse legacy .doc file", e);
+                        throw new Exception("Legacy .doc parsing failed. Ensure file is not corrupted.");
                     }
                 }
-            } else if (ext.startsWith("xls")) {
-                try (Workbook wb = WorkbookFactory.create(fis)) {
-                                DataFormatter formatter = new DataFormatter();
-                                FormulaEvaluator evaluator = wb.getCreationHelper().createFormulaEvaluator();
-                    Sheet s = wb.getSheetAt(0);
-                              // DataFormatter df = new DataFormatter();
-                    for (Row r : s) {
+                else {
+                	try (XWPFDocument doc = new XWPFDocument(fis)) {
+            	        for (IBodyElement element : doc.getBodyElements()) {
+            	            if (element instanceof XWPFParagraph) {
+            	                String text = ((XWPFParagraph) element).getText();
+            	                if (text != null && !text.trim().isEmpty()) lines.add(text.trim());
+            	            } else if (element instanceof XWPFTable) {
+            	                XWPFTable table = (XWPFTable) element;
+            	                int maxCols = 0;
+            	                for (XWPFTableRow row : table.getRows()) {
+            	                    maxCols = Math.max(maxCols, row.getTableCells().size());
+            	                }
+            	                for (XWPFTableRow row : table.getRows()) {
+            	                    StringBuilder sb = new StringBuilder();
+            	                    List<XWPFTableCell> cells = row.getTableCells();
+            	                    for (XWPFTableCell cell : cells) {
+            	                        String cellText = cell.getText().replace("\n", " ").trim();
+            	                        sb.append(cellText).append(" | ");
+            	                    }
+            	                    for (int i = cells.size(); i < maxCols; i++) {
+            	                        sb.append("  | "); 
+            	                    }
+            	                    lines.add(sb.toString().trim());
+            	                }
+            	            }
+            	        }
+            	    }
+//                    try (XWPFDocument doc = new XWPFDocument(fis)) {
+//                        for (XWPFParagraph p : doc.getParagraphs()) if (!p.getText().trim().isEmpty()) lines.add(p.getText().trim());
+//                    }
+                }
+            
+            } else if (ext.contains("xls")) {
+            try (Workbook wb = WorkbookFactory.create(fis)) {
+                DataFormatter formatter = new DataFormatter();
+                FormulaEvaluator evaluator = wb.getCreationHelper().createFormulaEvaluator();
+                for (int i = 0; i < wb.getNumberOfSheets(); i++) {
+                    Sheet sheet = wb.getSheetAt(i);
+                    String sheetName = sheet.getSheetName();
+                    if (i > 0) {
+                        lines.add(""); 
+                    }
+                    lines.add("--- SHEET: " + sheetName.toUpperCase() + " ---");
+                    for (Row row : sheet) {
                         StringBuilder sb = new StringBuilder();
-                                    int lastCol = r.getLastCellNum();
-                                    for (int cn = 0; cn < lastCol; cn++) {
-                                        Cell c = r.getCell(cn, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-                                        String val = formatter.formatCellValue(c, evaluator).replaceAll("\\s+", " ").trim();
-                                        sb.append(val);
-                                        if (cn < lastCol - 1) sb.append(" | ");
-                                    }
-                                  // for (Cell c : r) sb.append(df.formatCellValue(c)).append(" | ");
-                        if (sb.length() > 0) lines.add(sb.toString().trim());
+                        sb.append("[").append(sheetName).append("] ");
+                        for (Cell cell : row) {
+                            if (cell != null) {
+                            String cellValue = formatter.formatCellValue(cell, evaluator).trim();
+                            if (!cellValue.isEmpty()) {
+                                sb.append(cellValue).append(" | ");
+                            }
+                            }
+                        }
+                        String finalLine = sb.toString().trim();
+                       if (finalLine.endsWith("|")) {
+                           finalLine = finalLine.substring(0, finalLine.length() - 1).trim();
+                       }
+                       if (finalLine.length() > (sheetName.length() + 3)) {
+                           lines.add(finalLine);
+                           }
                     }
                 }
             }
-        } finally { 
-            if (file != null && file.exists()) file.delete(); 
         }
+        } finally { if (file != null && file.exists()) file.delete(); }
         return lines;
     }
 
@@ -201,17 +249,16 @@ public class SideBySideFileCompareService implements JavaService2 {
         String[] rWords = right.split(delimiter, -1);
         Set<String> otherSide = new HashSet<>();
         for (String w : (isOldSide ? rWords : lWords)) otherSide.add(w.trim().toLowerCase());
-
         StringBuilder sb = new StringBuilder();
         String[] currentSide = isOldSide ? lWords : rWords;
         String color = isOldSide ? "#C0392B" : "#27AE60"; 
-
         for (String word : currentSide) {
-            if (word.trim().isEmpty()) { sb.append(joiner); continue; }
-            if (!otherSide.contains(word.trim().toLowerCase())) {
-                sb.append("<b><font color='").append(color).append("'>").append(escapeHtml(word.trim())).append("</font></b>").append(joiner);
+            String wTrim = word.trim();
+            if (wTrim.isEmpty()) { sb.append(joiner); continue; }
+            if (!otherSide.contains(wTrim.toLowerCase())) {
+                sb.append("<b><font color='").append(color).append("'>").append(escapeHtml(wTrim)).append("</font></b>").append(joiner);
             } else {
-                sb.append(escapeHtml(word.trim())).append(joiner);
+                sb.append(escapeHtml(wTrim)).append(joiner);
             }
         }
         return sb.toString().trim();
