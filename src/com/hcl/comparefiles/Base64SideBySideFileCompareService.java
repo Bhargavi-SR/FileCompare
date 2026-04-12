@@ -33,57 +33,62 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
     private static final double SIMILARITY_THRESHOLD = 0.60;
     @Override
     public Object invoke(String methodID, Object[] inputArray, DataControllerRequest request, DataControllerResponse response) {
-        Result result = new Result();
-        Dataset ds = new Dataset("diffResults");
+            Result result = new Result();
+            Dataset ds = new Dataset("diffResults");
+            try {
+                String base64A = request.getParameter("fileA_base64");
+                String base64B = request.getParameter("fileB_base64");
+                String extA = request.getParameter("extA");
+                String extB = request.getParameter("extB");
+                if (base64A == null || base64B == null) throw new Exception("Input base64 missing");
+                List<String> leftLines = extractText(base64A, extA);
+                List<String> rightLines = extractText(base64B, extB);
+                List<DiffRow> finalRows = performAlignment(leftLines, rightLines);
 
-        try {
-            String base64A = request.getParameter("fileA_base64");
-            String base64B = request.getParameter("fileB_base64");
-            String extA = request.getParameter("extA");
-            String extB = request.getParameter("extB");
-
-            if (base64A == null || base64B == null) throw new Exception("Input base64 missing");
-
-            List<String> leftLines = extractText(base64A, extA);
-            List<String> rightLines = extractText(base64B, extB);
-
-            List<DiffRow> finalRows = performAlignment(leftLines, rightLines);
-
-            boolean hasChanges = false;
-            for (DiffRow row : finalRows) {
-                if (!"UNCHANGED".equals(row.type)) hasChanges = true;
-                Record rec = new Record();
-                if (row.left.startsWith("IMG_DATA:") || row.right.startsWith("IMG_DATA:")) {
-                    rec.addParam(new Param("isImage", "true"));
-                    rec.addParam(new Param("leftText", row.left.replace("IMG_DATA:", "")));
-                    rec.addParam(new Param("rightText", row.right.replace("IMG_DATA:", "")));
-                } else {
-                    rec.addParam(new Param("isImage", "false"));
-                    if ("MODIFIED".equals(row.type)) {
-                        rec.addParam(new Param("leftText", getInlineDiff(row.left, row.right, true)));
-                        rec.addParam(new Param("rightText", getInlineDiff(row.left, row.right, false)));
-                    } else {
-                        rec.addParam(new Param("leftText", escapeHtml(row.left)));
-                        rec.addParam(new Param("rightText", escapeHtml(row.right)));
+                boolean isIdentical = true;
+                for (DiffRow row : finalRows) {
+                    if (!"UNCHANGED".equals(row.type)) {
+                        isIdentical = false;
+                        break;
                     }
                 }
-                rec.addParam(new Param("leftLineNo", row.leftNo > 0 ? String.valueOf(row.leftNo) : ""));
-                rec.addParam(new Param("rightLineNo", row.rightNo > 0 ? String.valueOf(row.rightNo) : ""));
-                rec.addParam(new Param("diffType", row.type));
-                ds.addRecord(rec);
+                if (isIdentical) {
+                    result.addDataset(new Dataset("diffResults"));
+                    result.addParam(new Param("status", "SUCCESS"));
+                    result.addParam(new Param("isIdentical", String.valueOf(isIdentical)));
+                    return result;
+                }
+                for (DiffRow row : finalRows) {
+                    Record rec = new Record();
+                    if (row.left.startsWith("IMG_DATA:") || row.right.startsWith("IMG_DATA:")) {
+                        rec.addParam(new Param("isImage", "true"));
+                        rec.addParam(new Param("leftText", row.left.replace("IMG_DATA:", "")));
+                        rec.addParam(new Param("rightText", row.right.replace("IMG_DATA:", "")));
+                    } else {
+                        rec.addParam(new Param("isImage", "false"));
+                        if ("MODIFIED".equals(row.type)) {
+                            rec.addParam(new Param("leftText", getInlineDiff(row.left, row.right, true)));
+                            rec.addParam(new Param("rightText", getInlineDiff(row.left, row.right, false)));
+                        } else {
+                            rec.addParam(new Param("leftText", escapeHtml(row.left)));
+                            rec.addParam(new Param("rightText", escapeHtml(row.right)));
+                        }
+                    }
+                    rec.addParam(new Param("leftLineNo", row.leftNo > 0 ? String.valueOf(row.leftNo) : ""));
+                    rec.addParam(new Param("rightLineNo", row.rightNo > 0 ? String.valueOf(row.rightNo) : ""));
+                    rec.addParam(new Param("diffType", row.type));
+                    ds.addRecord(rec);
+                }
+                result.addDataset(ds);
+                result.addParam(new Param("isIdentical", String.valueOf(isIdentical)));
+                result.addParam(new Param("status", "SUCCESS"));
+            } catch (Throwable e) {
+                logger.error("Service Critical Failure", e);
+                result.addParam(new Param("status", "FAILED"));
+                result.addParam(new Param("errorMessage", "Error: " + e.getMessage()));
             }
-
-            result.addDataset(ds);
-            result.addParam(new Param("status", "SUCCESS"));
-//            result.addParam(new Param("isIdentical", String.valueOf(!hasChanges)));
-
-        } catch (Throwable e) {
-            logger.error("Service Critical Failure", e);
-            result.addParam(new Param("status", "FAILED"));
-            result.addParam(new Param("errorMessage", "Error: " + e.getMessage()));
+            return result;
         }
-        return result;
-    }
 
     private List<String> extractText(String base64, String ext) throws Exception {
         String cleanB64 = base64.contains(",") ? base64.split(",")[1] : base64;

@@ -12,6 +12,7 @@ import java.awt.image.BufferedImage;
 import javax.imageio.ImageIO;
 import org.apache.log4j.Logger;
 
+import com.hcl.comparefiles.Base64SideBySideFileCompareService.DiffRow;
 /* Volt MX Middleware */
 import com.hcl.voltmx.middleware.common.JavaService2;
 import com.hcl.voltmx.middleware.controller.DataControllerRequest;
@@ -57,16 +58,27 @@ public class SideBySideFileCompareService implements JavaService2 {
             int leftLineCounter = 1;
             int rightLineCounter = 1;
 
+            boolean isIdentical = true;
+            for (DiffRow row : finalRows) {
+                if (!"UNCHANGED".equals(row.type)) {
+                    isIdentical = false;
+                    break;
+                }
+            }
+            if (isIdentical) {
+                result.addDataset(new Dataset("diffResults"));
+                result.addParam(new Param("status", "SUCCESS"));
+                result.addParam(new Param("isIdentical", String.valueOf(isIdentical)));
+                return result;
+            }
             for (DiffRow row : finalRows) {
                 Record rec = new Record();
                 
-                // 1. IMAGE DETECTION
                 if (row.left.startsWith("IMG_DATA:") || row.right.startsWith("IMG_DATA:")) {
                     rec.addParam(new Param("isImage", "true"));
                     rec.addParam(new Param("leftText", row.left.replace("IMG_DATA:", "")));
                     rec.addParam(new Param("rightText", row.right.replace("IMG_DATA:", "")));
                 } 
-                // 2. TEXT COMPARISON
                 else {
                     rec.addParam(new Param("isImage", "false"));
                     if ("MODIFIED".equals(row.type)) {
@@ -85,7 +97,7 @@ public class SideBySideFileCompareService implements JavaService2 {
             }
 
             result.addDataset(ds);
-//            result.addParam(new Param("isIdentical", String.valueOf(leftLines.equals(rightLines))));
+            result.addParam(new Param("isIdentical", String.valueOf(isIdentical)));
             result.addParam(new Param("status", "SUCCESS"));
 
         } catch (Exception e) {
