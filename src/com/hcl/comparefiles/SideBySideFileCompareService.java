@@ -12,7 +12,6 @@ import java.awt.image.BufferedImage;
 import javax.imageio.ImageIO;
 import org.apache.log4j.Logger;
 
-import com.hcl.comparefiles.Base64SideBySideFileCompareService.DiffRow;
 /* Volt MX Middleware */
 import com.hcl.voltmx.middleware.common.JavaService2;
 import com.hcl.voltmx.middleware.controller.DataControllerRequest;
@@ -23,12 +22,14 @@ import com.hcl.voltmx.middleware.dataobject.*;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xwpf.usermodel.*;
 import org.apache.poi.xslf.usermodel.*;
+import org.apache.poi.EncryptedDocumentException;
 import org.apache.poi.hwpf.HWPFDocument;
 import org.apache.poi.hwpf.extractor.WordExtractor;
 
 /* PDFBox 3.x (Modern) */
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.encryption.InvalidPasswordException;
 import org.apache.pdfbox.text.PDFTextStripper;
 
 public class SideBySideFileCompareService implements JavaService2 {
@@ -65,12 +66,12 @@ public class SideBySideFileCompareService implements JavaService2 {
                     break;
                 }
             }
-            if (isIdentical) {
-                result.addDataset(new Dataset("diffResults"));
-                result.addParam(new Param("status", "SUCCESS"));
-                result.addParam(new Param("isIdentical", String.valueOf(isIdentical)));
-                return result;
-            }
+//            if (isIdentical) {
+//                result.addDataset(new Dataset("diffResults"));
+//                result.addParam(new Param("status", "SUCCESS"));
+//                result.addParam(new Param("isIdentical", String.valueOf(isIdentical)));
+//                return result;
+//            }
             for (DiffRow row : finalRows) {
                 Record rec = new Record();
                 
@@ -102,6 +103,16 @@ public class SideBySideFileCompareService implements JavaService2 {
 
         } catch (Exception e) {
             logger.error("Error in SideBySideFileCompareService", e);
+	        String msg = e.getMessage();
+	        if (msg != null && msg.contains("UNSUPPORTED")) {
+	            result.addParam(new Param("errorType", "UNSUPPORTED"));
+	        } else if (msg != null && msg.contains("CORRUPTED")) {
+	            result.addParam(new Param("errorType", "CORRUPTED"));
+	        } else if ("LOCKED".equals(msg) || msg.contains("PASSWORD_PROTECTED")) {
+            	result.addParam(new Param("errorType", "LOCKED"));
+            } else {
+	            result.addParam(new Param("errorType", "GENERAL_ERROR"));
+	        }
             result.addParam(new Param("status", "FAILED"));
             result.addParam(new Param("errorMessage", e.getMessage()));
         }
@@ -122,6 +133,10 @@ public class SideBySideFileCompareService implements JavaService2 {
                     for (String s : stripper.getText(doc).split("\\r?\\n")) {
                         if (!s.trim().isEmpty()) lines.add(s.trim());
                     }
+                }catch (InvalidPasswordException e) {
+                    throw new Exception("PASSWORD_PROTECTED");
+                }catch (Exception e) {
+                    throw new Exception("CORRUPTED_EXCEL_FILE");
                 }
             } 
             // PPTX 4.x
@@ -145,6 +160,8 @@ public class SideBySideFileCompareService implements JavaService2 {
                             }
                         }
                     }
+                }catch (Exception e) {
+                    throw new Exception("CORRUPTED_PPT_FILE");
                 }
             } else if (ext.startsWith("doc")){
             	// UPDATED: Legacy .doc handler
@@ -161,6 +178,8 @@ public class SideBySideFileCompareService implements JavaService2 {
                                 }
                             }
                         }
+                    } catch (EncryptedDocumentException e) {
+                        throw new Exception("PASSWORD_PROTECTED");
                     } catch (Exception e) {
                         logger.error("Failed to parse legacy .doc file", e);
                         throw new Exception("Legacy .doc parsing failed. Ensure file is not corrupted.");
@@ -192,6 +211,10 @@ public class SideBySideFileCompareService implements JavaService2 {
             	                }
             	            }
             	        }
+            	    }catch (EncryptedDocumentException e) {
+            	        throw new Exception("PASSWORD_PROTECTED");
+            	    } catch (Exception e) {
+            	        throw new Exception("CORRUPTED_DOCX_FILE");
             	    }
 //                    try (XWPFDocument doc = new XWPFDocument(fis)) {
 //                        for (XWPFParagraph p : doc.getParagraphs()) if (!p.getText().trim().isEmpty()) lines.add(p.getText().trim());
@@ -214,7 +237,52 @@ public class SideBySideFileCompareService implements JavaService2 {
                         sb.append("[").append(sheetName).append("] ");
                         for (Cell cell : row) {
                             if (cell != null) {
-                            String cellValue = formatter.formatCellValue(cell, evaluator).trim();
+                           // String cellValue = formatter.formatCellValue(cell, evaluator).trim();
+                            	String cellValue = "";
+
+                            	if (cell != null) {
+                            	    switch (cell.getCellType()) {
+
+                            	        case NUMERIC:
+                            	            double num = cell.getNumericCellValue();
+
+                            	            // Remove .0 for whole numbers
+                            	            if (num == (long) num) {
+                            	                cellValue = String.valueOf((long) num);
+                            	            } else {
+                            	                cellValue = String.valueOf(num);
+                            	            }
+                            	            break;
+
+                            	        case STRING:
+                            	            cellValue = cell.getStringCellValue().trim();
+                            	            break;
+
+                            	        case FORMULA:
+                            	            CellValue evaluated = evaluator.evaluate(cell);
+                            	            if (evaluated != null) {
+                            	                switch (evaluated.getCellType()) {
+                            	                    case NUMERIC:
+                            	                        double fnum = evaluated.getNumberValue();
+                            	                        if (fnum == (long) fnum) {
+                            	                            cellValue = String.valueOf((long) fnum);
+                            	                        } else {
+                            	                            cellValue = String.valueOf(fnum);
+                            	                        }
+                            	                        break;
+                            	                    case STRING:
+                            	                        cellValue = evaluated.getStringValue().trim();
+                            	                        break;
+                            	                    default:
+                            	                        cellValue = formatter.formatCellValue(cell, evaluator).trim();
+                            	                }
+                            	            }
+                            	            break;
+
+                            	        default:
+                            	            cellValue = formatter.formatCellValue(cell, evaluator).trim();
+                            	    }
+                            	}
                             if (!cellValue.isEmpty()) {
                                 sb.append(cellValue).append(" | ");
                             }
@@ -229,7 +297,11 @@ public class SideBySideFileCompareService implements JavaService2 {
                            }
                     }
                 }
-            }
+            }catch (EncryptedDocumentException e) {
+                throw new Exception("PASSWORD_PROTECTED");
+            }catch (Exception e) {
+                throw new Exception("CORRUPTED_EXCEL_FILE");
+            } 
         }
         } finally { if (file != null && file.exists()) file.delete(); }
         return lines;
@@ -267,7 +339,15 @@ public class SideBySideFileCompareService implements JavaService2 {
         for (String word : currentSide) {
             String wTrim = word.trim();
             if (wTrim.isEmpty()) { sb.append(joiner); continue; }
-            if (!otherSide.contains(wTrim.toLowerCase())) {
+            boolean found = false;
+            for (String o : otherSide) {
+                if (isSameValue(wTrim, o.trim())) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
                 sb.append("<b><font color='").append(color).append("'>").append(escapeHtml(wTrim)).append("</font></b>").append(joiner);
             } else {
                 sb.append(escapeHtml(wTrim)).append(joiner);
@@ -280,7 +360,7 @@ public class SideBySideFileCompareService implements JavaService2 {
         if (s == null) return "";
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&apos;");
     }
-
+/*
     private List<DiffRow> performPriorityAlignment(List<String> a, List<String> b) {
         int m = a.size(), n = b.size();
         int[][] lcs = new int[m + 1][n + 1];
@@ -310,7 +390,64 @@ public class SideBySideFileCompareService implements JavaService2 {
         Collections.reverse(result);
         return result;
     }
+*/
+    private List<DiffRow> performPriorityAlignment(List<String> a, List<String> b) {
 
+        int m = a.size(), n = b.size();
+        int[][] lcs = new int[m + 1][n + 1];
+
+        // Build LCS using normalized values
+        for (int i = 1; i <= m; i++) {
+            for (int j = 1; j <= n; j++) {
+
+                String leftNorm = normalizeLine(a.get(i - 1));
+                String rightNorm = normalizeLine(b.get(j - 1));
+
+                if (leftNorm.equals(rightNorm)) {
+                    lcs[i][j] = lcs[i - 1][j - 1] + 1;
+                } else {
+                    lcs[i][j] = Math.max(lcs[i - 1][j], lcs[i][j - 1]);
+                }
+            }
+        }
+
+        List<DiffRow> result = new ArrayList<>();
+        int i = m, j = n;
+
+        while (i > 0 || j > 0) {
+
+            String leftRaw = (i > 0) ? a.get(i - 1) : "";
+            String rightRaw = (j > 0) ? b.get(j - 1) : "";
+
+            String leftNorm = normalizeLine(leftRaw);
+            String rightNorm = normalizeLine(rightRaw);
+
+            if (i > 0 && j > 0 && leftNorm.equals(rightNorm)) {
+
+                result.add(new DiffRow(leftRaw, rightRaw, "UNCHANGED"));
+                i--; j--;
+
+            } else if (i > 0 && j > 0 &&
+                       getSimilarity(leftNorm, rightNorm) >= SIMILARITY_THRESHOLD) {
+
+                result.add(new DiffRow(leftRaw, rightRaw, "MODIFIED"));
+                i--; j--;
+
+            } else if (i > 0 && (j == 0 || lcs[i - 1][j] >= lcs[i][j - 1])) {
+
+                result.add(new DiffRow(leftRaw, "", "REMOVED"));
+                i--;
+
+            } else {
+
+                result.add(new DiffRow("", rightRaw, "ADDED"));
+                j--;
+            }
+        }
+
+        Collections.reverse(result);
+        return result;
+    }
     private double getSimilarity(String s1, String s2) {
         if (s1.isEmpty() || s2.isEmpty() || s1.startsWith("IMG_DATA") || s2.startsWith("IMG_DATA")) return 0;
         int distance = levenshteinDistance(s1, s2);
@@ -366,6 +503,29 @@ public class SideBySideFileCompareService implements JavaService2 {
             this.left = l == null ? "" : l; 
             this.right = r == null ? "" : r; 
             this.type = t; 
+        }
+    }
+    
+    private String normalizeLine(String line) {
+        if (line == null) return "";
+
+        String normalized = line;
+
+        normalized = normalized.replace(",", "|");
+        normalized = normalized.replaceAll("\\s*\\|\\s*", "|");
+        normalized = normalized.replaceAll("\\|+$", "");
+        normalized = normalized.trim().toLowerCase();
+
+        return normalized;
+    }
+    
+    private boolean isSameValue(String a, String b) {
+        try {
+            double d1 = Double.parseDouble(a);
+            double d2 = Double.parseDouble(b);
+            return Double.compare(d1, d2) == 0;
+        } catch (Exception e) {
+            return a.equalsIgnoreCase(b);
         }
     }
 }

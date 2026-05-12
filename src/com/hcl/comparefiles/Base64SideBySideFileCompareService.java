@@ -19,11 +19,13 @@ import org.apache.poi.xwpf.usermodel.*;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.hwpf.HWPFDocument;
 import org.apache.poi.hwpf.extractor.WordExtractor;
+import org.apache.poi.EncryptedDocumentException;
 
 /* PDFBox 3.x (Latest) */
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.pdfbox.pdmodel.encryption.InvalidPasswordException;
 
 import org.apache.poi.xslf.usermodel.*;
 
@@ -52,12 +54,12 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
                         break;
                     }
                 }
-                if (isIdentical) {
-                    result.addDataset(new Dataset("diffResults"));
-                    result.addParam(new Param("status", "SUCCESS"));
-                    result.addParam(new Param("isIdentical", String.valueOf(isIdentical)));
-                    return result;
-                }
+//                if (isIdentical) {
+//                    result.addDataset(new Dataset("diffResults"));
+//                    result.addParam(new Param("status", "SUCCESS"));
+//                    result.addParam(new Param("isIdentical", String.valueOf(isIdentical)));
+//                    return result;
+//                }
                 for (DiffRow row : finalRows) {
                     Record rec = new Record();
                     if (row.left.startsWith("IMG_DATA:") || row.right.startsWith("IMG_DATA:")) {
@@ -84,6 +86,16 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
                 result.addParam(new Param("status", "SUCCESS"));
             } catch (Throwable e) {
                 logger.error("Service Critical Failure", e);
+                String msg = e.getMessage();
+                if (msg != null && msg.contains("UNSUPPORTED")) {
+                    result.addParam(new Param("errorType", "UNSUPPORTED"));
+                } else if (msg != null && msg.contains("CORRUPTED")) {
+                    result.addParam(new Param("errorType", "CORRUPTED"));
+                } else if ("LOCKED".equals(msg) || msg.contains("PASSWORD_PROTECTED")) {
+                	result.addParam(new Param("errorType", "LOCKED"));
+                } else {
+                    result.addParam(new Param("errorType", "GENERAL_ERROR"));
+                }
                 result.addParam(new Param("status", "FAILED"));
                 result.addParam(new Param("errorMessage", "Error: " + e.getMessage()));
             }
@@ -122,6 +134,10 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
         	                }
         	            }
         	        }
+        	    } catch (EncryptedDocumentException e) {
+        	        throw new Exception("PASSWORD_PROTECTED");
+        	    } catch (Exception e) {
+        	        throw new Exception("CORRUPTED_DOCX_FILE");
         	    }
         	}
         	else if (nExt.endsWith("doc")) {
@@ -141,6 +157,8 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
                             }
                         }
                     }
+                } catch (EncryptedDocumentException e) {
+                    throw new Exception("PASSWORD_PROTECTED");
                 } catch (Throwable e) {
                     logger.error("Failed to parse legacy .doc file", e);
                     throw new Exception("File identified as .doc but failed to parse. Check poi-scratchpad jar."+e);
@@ -176,6 +194,10 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
                                }
                         }
                     }
+                } catch (EncryptedDocumentException e) {
+                    throw new Exception("PASSWORD_PROTECTED");
+                } catch (Exception e) {
+                    throw new Exception("CORRUPTED_EXCEL_FILE");
                 }
             }
             else if (nExt.endsWith("pdf")) {
@@ -185,6 +207,10 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
                     for (String line : text.split("\\r?\\n")) {
                         if (!line.trim().isEmpty()) lines.add(line.trim());
                     }
+                } catch (InvalidPasswordException e) {
+                    throw new Exception("PASSWORD_PROTECTED");
+                } catch (IOException e) {
+                    throw new Exception("CORRUPTED_PDF_FILE");
                 }
             }
             else if (nExt.contains("pptx")) {
@@ -204,6 +230,8 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
                             }
                         }
                     }
+                } catch (Exception e) {
+                    throw new Exception("CORRUPTED_PPT_FILE");
                 }
             }
             else {
@@ -237,6 +265,7 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
         }
     }
 
+    /*
     private List<DiffRow> performAlignment(List<String> a, List<String> b) {
         int m = a.size(), n = b.size();
         int[][] lcs = new int[m + 1][n + 1];
@@ -248,6 +277,7 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
         }
         List<DiffRow> result = new ArrayList<>();
         int i = m, j = n;
+       
         while (i > 0 || j > 0) {
             if (i > 0 && j > 0 && a.get(i - 1).equals(b.get(j - 1))) {
                 result.add(new DiffRow(a.get(i - 1), b.get(j - 1), "UNCHANGED", i, j));
@@ -263,6 +293,64 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
                 j--;
             }
         }
+        Collections.reverse(result);
+        return result;
+    }
+*/
+    private List<DiffRow> performAlignment(List<String> a, List<String> b) {
+
+        int m = a.size(), n = b.size();
+        int[][] lcs = new int[m + 1][n + 1];
+
+        // Build LCS using normalized values
+        for (int i = 1; i <= m; i++) {
+            for (int j = 1; j <= n; j++) {
+
+                String leftNorm = normalizeLine(a.get(i - 1));
+                String rightNorm = normalizeLine(b.get(j - 1));
+
+                if (leftNorm.equals(rightNorm)) {
+                    lcs[i][j] = lcs[i - 1][j - 1] + 1;
+                } else {
+                    lcs[i][j] = Math.max(lcs[i - 1][j], lcs[i][j - 1]);
+                }
+            }
+        }
+
+        List<DiffRow> result = new ArrayList<>();
+        int i = m, j = n;
+
+        while (i > 0 || j > 0) {
+
+            String leftRaw = (i > 0) ? a.get(i - 1) : "";
+            String rightRaw = (j > 0) ? b.get(j - 1) : "";
+
+            String leftNorm = normalizeLine(leftRaw);
+            String rightNorm = normalizeLine(rightRaw);
+
+            if (i > 0 && j > 0 && leftNorm.equals(rightNorm)) {
+
+                result.add(new DiffRow(leftRaw, rightRaw, "UNCHANGED", i, j));
+                i--; j--;
+
+            } else if (i > 0 && j > 0 &&
+                       getSimilarity(leftNorm, rightNorm) >= SIMILARITY_THRESHOLD) {
+
+                result.add(new DiffRow(leftRaw, rightRaw, "MODIFIED", i, j));
+                i--; j--;
+
+            } else if (i > 0 && (j == 0 || lcs[i - 1][j] >= lcs[i][j - 1])) {
+
+                result.add(new DiffRow(leftRaw, "", "REMOVED", i, 0));
+                i--;
+
+            } else {
+
+                result.add(new DiffRow("", rightRaw, "ADDED", 0, j));
+                j--;
+            }
+        }
+
         Collections.reverse(result);
         return result;
     }
@@ -301,7 +389,16 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
         String color = isOldSide ? "#C0392B" : "#27AE60"; 
         for (String word : currentSide) {
             if (word.trim().isEmpty()) { sb.append(joiner); continue; }
-            if (!otherSide.contains(word.trim().toLowerCase())) {
+           // if (!otherSide.contains(word.trim().toLowerCase())) {
+            boolean found = false;
+            for (String o : otherSide) {
+                if (isSameValue(word.trim(), o.trim())) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
                 sb.append("<b><font color='").append(color).append("'>").append(escapeHtml(word.trim())).append("</font></b>").append(joiner);
             } else {
                 sb.append(escapeHtml(word.trim())).append(joiner);
@@ -324,6 +421,29 @@ public class Base64SideBySideFileCompareService implements JavaService2 {
             this.type = t;
             this.leftNo = lNo;
             this.rightNo = rNo;
+        }
+    }
+    
+    private String normalizeLine(String line) {
+        if (line == null) return "";
+
+        String normalized = line;
+
+        normalized = normalized.replace(",", "|");
+        normalized = normalized.replaceAll("\\s*\\|\\s*", "|");
+        normalized = normalized.replaceAll("\\|+$", "");
+        normalized = normalized.trim().toLowerCase();
+
+        return normalized;
+    }
+    
+    private boolean isSameValue(String a, String b) {
+        try {
+            double d1 = Double.parseDouble(a);
+            double d2 = Double.parseDouble(b);
+            return Double.compare(d1, d2) == 0;
+        } catch (Exception e) {
+            return a.equalsIgnoreCase(b);
         }
     }
 }
